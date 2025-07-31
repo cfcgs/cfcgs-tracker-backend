@@ -1,23 +1,45 @@
+import math
 from typing import Optional
 
 from fastapi import HTTPException
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session, joinedload
-from src.cfcgs_tracker.models import Fund, FundType, FundFocus
+from src.cfcgs_tracker.models import (
+    Fund,
+    FundType,
+    FundFocus,
+    Project,
+    Country,
+    Region,
+    Commitment,
+    FundingEntity,
+)
 import pandas as pd
 
-from src.cfcgs_tracker.schemas import FundSchema, FundStatusFilter, FundDataFilter, FundTypeSchema, FundFocusSchema, \
-    FundTypeUpdateSchema, FundUpdateSchema, FundFocusUpdateSchema
+from src.cfcgs_tracker.schemas import (
+    FundSchema,
+    FundStatusFilter,
+    FundDataFilter,
+    FundTypeSchema,
+    FundFocusSchema,
+    FundTypeUpdateSchema,
+    FundUpdateSchema,
+    FundFocusUpdateSchema,
+    FundProjectDataFilter,
+    FundProjectSchema,
+    CommitmentDataFilter,
+    CommitmentDataSchema, CountrySchema, ObjectiveDataFilter, ObjectiveTotalSchema,
+)
 from src.utils.parser import safe_float, safe_int
 
 
 def insert_funds_from_df(db: Session, df: pd.DataFrame):
     """
-        Insere dados de fundos no banco a partir de um DataFrame, criando tipos e focos se necessário.
+    Insere dados de fundos no banco a partir de um DataFrame, criando tipos e focos se necessário.
 
-        Parâmetros:
-        - db: Sessão do banco de dados.
-        - df: DataFrame com os dados dos fundos.
+    Parâmetros:
+    - db: Sessão do banco de dados.
+    - df: DataFrame com os dados dos fundos.
     """
     for _, row in df.iterrows():
         # Buscar ou criar fund_type
@@ -30,7 +52,9 @@ def insert_funds_from_df(db: Session, df: pd.DataFrame):
 
         # Buscar ou criar fund_focus
         fund_focus_name = row.get("fund_focus")
-        fund_focus = db.query(FundFocus).filter_by(name=fund_focus_name).first()
+        fund_focus = (
+            db.query(FundFocus).filter_by(name=fund_focus_name).first()
+        )
         if not fund_focus:
             fund_focus = FundFocus(name=fund_focus_name)
             db.add(fund_focus)
@@ -54,17 +78,16 @@ def insert_funds_from_df(db: Session, df: pd.DataFrame):
     db.commit()
 
 
-def get_fund_status(db: Session,
-                    filters: FundStatusFilter):
+def get_fund_status(db: Session, filters: FundStatusFilter):
     """
-        Retorna a soma de pledge, deposit e approval dos fundos conforme filtros aplicados.
+    Retorna a soma de pledge, deposit e approval dos fundos conforme filtros aplicados.
 
-        Parâmetros:
-        - db: Sessão do banco de dados.
-        - filters: Filtros de fundos, tipos e focos.
+    Parâmetros:
+    - db: Sessão do banco de dados.
+    - filters: Filtros de fundos, tipos e focos.
 
-        Retorna:
-        - Linha com totais ou None.
+    Retorna:
+    - Linha com totais ou None.
     """
     query = db.query(
         func.sum(Fund.pledge).label("total_pledge"),
@@ -81,25 +104,24 @@ def get_fund_status(db: Session,
     return query.one_or_none()
 
 
-def get_funds_data(db: Session, filters: FundDataFilter, limit: int, offset: int):
+def get_funds_data(
+    db: Session, filters: FundDataFilter, limit: int, offset: int
+):
     """
-        Retorna lista de fundos com filtros e paginação aplicados.
+    Retorna lista de fundos com filtros e paginação aplicados.
 
-        Parâmetros:
-        - db: Sessão do banco de dados.
-        - filters: Filtros de tipo e foco.
-        - limit: Máximo de resultados.
-        - offset: Deslocamento (para paginação).
+    Parâmetros:
+    - db: Sessão do banco de dados.
+    - filters: Filtros de tipo e foco.
+    - limit: Máximo de resultados.
+    - offset: Deslocamento (para paginação).
 
-        Retorna:
-        - Lista de FundSchema.
+    Retorna:
+    - Lista de FundSchema.
     """
     query = (
         select(Fund)
-        .options(
-            joinedload(Fund.fund_type),
-            joinedload(Fund.fund_focus)
-        )
+        .options(joinedload(Fund.fund_type), joinedload(Fund.fund_focus))
         .limit(limit)
         .offset(offset)
     )
@@ -128,10 +150,12 @@ def get_funds_data(db: Session, filters: FundDataFilter, limit: int, offset: int
 
     return funds_data
 
+
 def get_fund_types(db: Session):
     """Retorna todos os tipos de fundos cadastrados"""
     result = db.scalars(select(FundType).order_by(FundType.id)).all()
     return result
+
 
 def get_fund_focuses(db: Session):
     """Retorna todos os focos dos fundos cadastrados"""
@@ -159,7 +183,9 @@ def delete_fund_by_id(db: Session, fund_id: int) -> bool:
     return True
 
 
-def update_fund_by_id(db: Session, fund_id: int, fund_data: FundUpdateSchema) -> Optional[FundSchema]:
+def update_fund_by_id(
+    db: Session, fund_id: int, fund_data: FundUpdateSchema
+) -> Optional[FundSchema]:
     """
     Atualiza um fundo pelo ID.
 
@@ -174,10 +200,7 @@ def update_fund_by_id(db: Session, fund_id: int, fund_data: FundUpdateSchema) ->
     fund = db.scalars(
         select(Fund)
         .where(Fund.id == fund_id)
-        .options(
-            joinedload(Fund.fund_type),
-            joinedload(Fund.fund_focus)
-        )
+        .options(joinedload(Fund.fund_type), joinedload(Fund.fund_focus))
     ).one_or_none()
     if not fund:
         return None
@@ -198,12 +221,16 @@ def update_fund_by_id(db: Session, fund_id: int, fund_data: FundUpdateSchema) ->
 
     # Atualiza relações se necessário
     if fund_data.fund_type:
-        fund_type = db.query(FundType).filter_by(name=fund_data.fund_type).first()
+        fund_type = (
+            db.query(FundType).filter_by(name=fund_data.fund_type).first()
+        )
         if fund_type:
             fund.fund_type_id = fund_type.id
 
     if fund_data.fund_focus:
-        fund_focus = db.query(FundFocus).filter_by(name=fund_data.fund_focus).first()
+        fund_focus = (
+            db.query(FundFocus).filter_by(name=fund_data.fund_focus).first()
+        )
         if fund_focus:
             fund.fund_focus_id = fund_focus.id
 
@@ -242,14 +269,18 @@ def delete_fund_type_by_id(db: Session, type_id: int) -> bool:
 
     # Verifica se há fundos usando este tipo
     if db.query(Fund).filter_by(fund_type_id=type_id).count() > 0:
-        raise HTTPException(status_code=400, detail="Cannot delete fund type in use by funds")
+        raise HTTPException(
+            status_code=400, detail="Cannot delete fund type in use by funds"
+        )
 
     db.delete(fund_type)
     db.commit()
     return True
 
 
-def update_fund_type_by_id(db: Session, type_id: int, type_data: FundTypeUpdateSchema) -> Optional[FundTypeSchema]:
+def update_fund_type_by_id(
+    db: Session, type_id: int, type_data: FundTypeUpdateSchema
+) -> Optional[FundTypeSchema]:
     """
     Atualiza um tipo de fundo pelo ID.
 
@@ -269,10 +300,7 @@ def update_fund_type_by_id(db: Session, type_id: int, type_data: FundTypeUpdateS
     db.commit()
     db.refresh(fund_type)
 
-    return FundTypeSchema(
-        id=fund_type.id,
-        name=fund_type.name
-    )
+    return FundTypeSchema(id=fund_type.id, name=fund_type.name)
 
 
 def delete_fund_focus_by_id(db: Session, focus_id: int) -> bool:
@@ -292,14 +320,18 @@ def delete_fund_focus_by_id(db: Session, focus_id: int) -> bool:
 
     # Verifica se há fundos usando este foco
     if db.query(Fund).filter_by(fund_focus_id=focus_id).count() > 0:
-        raise HTTPException(status_code=400, detail="Cannot delete fund focus in use by funds")
+        raise HTTPException(
+            status_code=400, detail="Cannot delete fund focus in use by funds"
+        )
 
     db.delete(fund_focus)
     db.commit()
     return True
 
 
-def update_fund_focus_by_id(db: Session, focus_id: int, focus_data: FundFocusUpdateSchema) -> Optional[FundFocusSchema]:
+def update_fund_focus_by_id(
+    db: Session, focus_id: int, focus_data: FundFocusUpdateSchema
+) -> Optional[FundFocusSchema]:
     """
     Atualiza um foco de fundo pelo ID.
 
@@ -319,7 +351,367 @@ def update_fund_focus_by_id(db: Session, focus_id: int, focus_data: FundFocusUpd
     db.commit()
     db.refresh(fund_focus)
 
-    return FundFocusSchema(
-        id=fund_focus.id,
-        name=fund_focus.name
+    return FundFocusSchema(id=fund_focus.id, name=fund_focus.name)
+
+
+def get_fund_projects_data(
+    db: Session, filters: FundProjectDataFilter, limit: int, offset: int
+):
+    query = select(Project).options(
+        joinedload(Project.country),
+        joinedload(Project.fund),
     )
+
+    if filters.funds:
+        query = query.where(Project.fund_id.in_(filters.funds))
+
+    if filters.countries:
+        query = query.where(Project.country_id.in_(filters.countries))
+
+    if filters.regions and filters.regions is not None:
+        query = (
+            query.join(Project.country)
+            .join(Country.region)
+            .where(Region.id.in_(filters.regions))
+        )
+
+    query = query.limit(limit).offset(offset)
+
+    orm_projects = db.scalars(query).all()
+
+    # --- TRANSFORMAÇÃO MANUAL E EXPLÍCITA ---
+    # Converte cada objeto SQLAlchemy no schema Pydantic desejado
+    response_schemas = []
+    for project in orm_projects:
+        schema_instance = FundProjectSchema(
+            id=project.id,
+            name=project.name,
+            fund_name=project.fund.fund_name if project.fund else None,
+            country_name=project.country.name if project.country else None,
+            region=project.country.region.name
+            if project.country and project.country.region
+            else None,
+        )
+        response_schemas.append(schema_instance)
+
+    return response_schemas
+
+
+def insert_fund_project_from_df(db: Session, df: pd.DataFrame):
+    try:
+        # Cache para otimização
+        existing_projects = {p.name: p for p in db.query(Project).all()}
+        existing_countries = {c.name: c for c in db.query(Country).all()}
+        existing_funds = {f.fund_name: f for f in db.query(Fund).all()}
+
+        for _, row in df.iterrows():
+            project_name = row.get("name_of_project")
+            country_name = row.get("country")
+            fund_name = row.get("fund")
+
+            if (
+                pd.isna(project_name)
+                or pd.isna(country_name)
+                or pd.isna(fund_name)
+            ):
+                continue
+
+            # Se o projeto já existe, pule
+            if project_name in existing_projects:
+                continue
+
+            # O fundo DEVE existir para projetos dos fundos
+            fund = existing_funds.get(fund_name)
+            if not fund:
+                raise ValueError(
+                    f"Fundo '{fund_name}' não encontrado para o projeto '{project_name}'."
+                )
+
+            # Get or Create para o País
+            country = existing_countries.get(country_name)
+            if not country:
+                country = Country(name=country_name)
+                db.add(country)
+                db.flush()
+                existing_countries[country_name] = country
+
+            # Cria o novo projeto com a associação ao Fundo
+            new_project = Project(name=project_name)
+            new_project.country = country
+            new_project.fund = fund
+            db.add(new_project)
+            existing_projects[project_name] = new_project
+
+        db.commit()
+
+    except Exception as e:
+        db.rollback()
+        raise e
+
+
+def get_or_create_country(
+    name: str, db: Session, countries_cache: dict[str, Country]
+) -> Country:
+    """
+    Busca um país pelo nome no cache/banco. Se não existir, cria um novo,
+    associa a região (se encontrada) e o adiciona ao cache.
+    """
+    country = countries_cache.get(name)
+    if not country:
+        # Cria a nova instância do país
+        country = Country(name=name)
+        db.add(country)
+        db.flush()
+        # Atualiza o cache para que o novo país possa ser reutilizado no mesmo loop
+        countries_cache[name] = country
+
+    return country
+
+
+def get_or_create_funding_entity(
+    name: str, db: Session, entities_cache: dict[str, FundingEntity]
+) -> FundingEntity:
+    """
+    Busca uma entidade financeira pelo nome no cache/banco.
+    Se não existir, cria uma nova e a adiciona ao cache.
+    """
+    # Retorna None se o nome for inválido para não criar entidades vazias
+    if not name or pd.isna(name):
+        return None
+
+    entity = entities_cache.get(name)
+    if not entity:
+        entity = FundingEntity(name=name)
+        db.add(entity)
+        db.flush()
+        entities_cache[name] = entity  # Atualiza o cache com a nova entidade
+    return entity
+
+def insert_commitments_from_df(db: Session, df: pd.DataFrame):
+    """Insere compromissos (da planilha CRDF), populando as tabelas de apoio."""
+    try:
+        # Cache de dados existentes
+        existing_projects = {p.name: p for p in db.query(Project).all()}
+        existing_entities = {c.name: c for c in db.query(FundingEntity).all()}
+        existing_countries = {c.name: c for c in db.query(Country).all()}
+
+        for _, row in df.iterrows():
+            project_title = row.get("project_title")
+            recipient_name = row.get("recipient")
+            provider_name = row.get("provider")
+            channel_name = row.get("channel_of_delivery")
+            year = row.get("year")
+            amount_str = row.get(
+                "climate-related_development_finance_-_commitment_-_current_usd_thousand"
+            )
+            adaptation_amount = safe_float(
+                row.get("adaptation-related_development_finance_-_commitment_-_current_usd_thousand"))
+            mitigation_amount = safe_float(
+                row.get("mitigation-related_development_finance_-_commitment_-_current_usd_thousand"))
+
+            if any(
+                pd.isna(val)
+                for val in [recipient_name, provider_name, year, amount_str]
+            ):
+                continue
+
+            provider_entity = get_or_create_funding_entity(
+                provider_name, db, existing_entities
+            )
+            channel_entity = get_or_create_funding_entity(
+                channel_name, db, existing_entities
+            )
+
+            recipient_country = get_or_create_country(
+                recipient_name, db, existing_countries
+            )
+
+            # Get or Create - Projeto (com fund_id NULO)
+            project = None  # O valor padrão para o projeto é None
+
+            # Só executa a lógica de projeto se um título foi fornecido na planilha
+            if pd.notna(project_title):
+                recipient_name = row.get("recipient")
+                if pd.isna(recipient_name):
+                    # Se há um título de projeto, o país receptor é obrigatório
+                    print(f"Aviso: Projeto '{project_title}' sem país receptor. Pulando criação do projeto.")
+                else:
+                    recipient_country = get_or_create_country(recipient_name, db, existing_countries)
+
+                    project = existing_projects.get(project_title)
+                    if not project:
+                        project = Project(name=project_title)
+                        project.country=recipient_country
+                        db.add(project)
+                        db.flush()
+                        existing_projects[project_title] = project
+
+            # Criar o registro de Compromisso
+            new_commitment = Commitment(
+                year=int(year),
+                amount_usd_thousand=safe_float(amount_str),
+                adaptation_amount_usd_thousand=adaptation_amount,
+                mitigation_amount_usd_thousand=mitigation_amount
+            )
+            new_commitment.project = project
+            new_commitment.channel = channel_entity
+            new_commitment.provider = provider_entity
+            new_commitment.recipient_country = recipient_country
+            db.add(new_commitment)
+
+        db.commit()
+
+    except Exception as e:
+        db.rollback()
+        raise e
+
+
+def get_commitments_data(
+    db: Session, filters: CommitmentDataFilter, limit: int, offset: int
+):
+    """
+    Busca e retorna uma lista de compromissos financeiros com base em filtros,
+    com paginação e dados de relacionamentos formatados.
+    """
+    # 1. Construção da Query Base
+    # Começamos selecionando a entidade principal (Commitment) e já pedimos
+    # para carregar os dados relacionados para evitar múltiplas queries.
+    query = select(Commitment).options(
+        joinedload(Commitment.channel),
+        joinedload(Commitment.provider),
+        joinedload(Commitment.project),
+    )
+
+    # 2. Aplicação dos Filtros
+    # Filtro por lista de anos
+    if filters.years:
+        query = query.where(Commitment.year.in_(filters.years))
+
+    # Filtro por lista de nomes de países (provedores)
+    if filters.countries:
+        # Precisamos fazer um JOIN com a tabela Country para filtrar pelo nome
+        query = query.join(Commitment.recipient_country).where(
+            Country.id.in_(filters.countries)
+        )
+
+    # 3. Paginação
+    query = query.limit(limit).offset(offset)
+
+    # Executa a query para obter os objetos SQLAlchemy
+    orm_commitments = db.scalars(query).all()
+
+    # 4. Transformação Manual para o Schema de Resposta
+    response_schemas = []
+    for commitment in orm_commitments:
+        schema_instance = CommitmentDataSchema(
+            id=commitment.id,
+            year=commitment.year,  # Converte o inteiro para string, como definido no schema
+            amount_usd_thousand=commitment.amount_usd_thousand,
+            # Acessa os nomes através dos objetos carregados pelo joinedload
+            channel_of_delivery=commitment.channel.name
+            if commitment.channel
+            else None,
+            provider_country=commitment.provider.name
+            if commitment.provider
+            else None,
+            recipient_country=commitment.recipient_country.name
+            if commitment.recipient_country
+            else None,
+            project=commitment.project.name if commitment.project else None,
+        )
+        response_schemas.append(schema_instance)
+
+    return response_schemas
+
+
+def get_regions(db: Session):
+    """Retorna todos as regiões cadastrados"""
+    result = db.scalars(select(Region).order_by(Region.id)).all()
+    return result
+
+
+def get_countries(db: Session):
+    """
+    Retorna todos os países cadastrados, formatados como CountrySchema.
+    """
+    # 1. Query otimizada para carregar a relação com Region (eager loading)
+    query = select(Country).options(joinedload(Country.region)).order_by(Country.id)
+
+    orm_countries = db.scalars(query).all()
+
+    # 2. Transforma cada objeto SQLAlchemy no schema Pydantic correspondente
+    response_schemas = []
+    for country in orm_countries:
+        schema_instance = CountrySchema(
+            id=country.id,
+            name=country.name,
+            # Extrai o nome do objeto de relacionamento, com segurança
+            region=country.region.name if country.region else None
+        )
+        response_schemas.append(schema_instance)
+
+    return response_schemas
+
+
+def get_recipient_countries(db: Session) -> list[CountrySchema]:
+    """
+    Retorna apenas os países que receberam pelo menos um compromisso financeiro,
+    formatados como CountrySchema.
+    """
+    # A mágica está no .where(Country.commitments_as_recipient.any())
+    # Isso filtra apenas os países que têm alguma entrada na relação 'commitments_as_recipient'
+    query = (
+        select(Country)
+        .where(Country.commitments_as_recipient.any())
+        .options(joinedload(Country.region))
+        .order_by(Country.name)  # Ordena por nome para o dropdown
+    )
+
+    orm_countries = db.scalars(query).all()
+
+    # Transforma os resultados para o schema Pydantic
+    response_schemas = [
+        CountrySchema(
+            id=country.id,
+            name=country.name,
+            region=country.region.name if country.region else None
+        )
+        for country in orm_countries
+    ]
+
+    return response_schemas
+
+
+def get_totals_by_objective(db: Session, filters: ObjectiveDataFilter):
+    query = (
+        select(
+            Commitment.year,
+            func.sum(func.coalesce(Commitment.adaptation_amount_usd_thousand, 0)).label("total_adaptation"),
+            func.sum(func.coalesce(Commitment.mitigation_amount_usd_thousand, 0)).label("total_mitigation")
+        )
+        .group_by(Commitment.year)
+        .order_by(Commitment.year)
+    )
+
+    if filters.years:
+        query = query.where(Commitment.year.in_(filters.years))
+
+    if filters.recipient_countries:
+        query = query.where(Commitment.recipient_country_id.in_(filters.recipient_countries))
+
+    result = db.execute(query).all()
+    print(result)
+    response_data = []
+    for row in result:
+        total_adaptation = row.total_adaptation
+        total_mitigation = row.total_mitigation
+
+        response_data.append(
+            ObjectiveTotalSchema(
+                year=row.year,
+                total_adaptation=0 if total_adaptation is None or math.isnan(total_adaptation) else total_adaptation,
+                total_mitigation=0 if total_mitigation is None or math.isnan(total_mitigation) else total_mitigation,
+            )
+        )
+
+    return response_data
