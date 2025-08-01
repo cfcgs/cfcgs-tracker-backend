@@ -2,6 +2,7 @@ from http import HTTPStatus
 from typing import Annotated, List
 
 from fastapi import APIRouter, Depends, UploadFile, File, HTTPException
+from fastapi.responses import StreamingResponse
 from sqlalchemy.orm import Session
 
 from src.cfcgs_tracker.database.database import get_session
@@ -13,6 +14,7 @@ from src.cfcgs_tracker.schemas import (
 from src.services.fund_service import (
     get_commitments_data,
     insert_commitments_from_df, get_totals_by_objective, get_commitment_time_series, get_distinct_commitment_years,
+    stream_commitments_csv,
 )
 from src.utils.parser import read_file
 
@@ -74,3 +76,21 @@ def read_distinct_commitment_years(session: T_Session):
     """Retorna uma lista de anos únicos em que ocorreram compromissos."""
     years = get_distinct_commitment_years(session)
     return years
+
+
+@router.get("/export/{year}", response_class=StreamingResponse)
+def export_commitments_by_year(year: int, session: T_Session):
+    """
+    Gera e faz o streaming de um arquivo CSV com todos os compromissos de um ano.
+    """
+    file_name = f"commitments_{year}.csv"
+    headers = {
+        "Content-Disposition": f"attachment; filename=\"{file_name}\""
+    }
+
+    # Retorna uma resposta de streaming que chama nosso gerador
+    return StreamingResponse(
+        stream_commitments_csv(session, year),
+        media_type="text/csv",
+        headers=headers
+    )

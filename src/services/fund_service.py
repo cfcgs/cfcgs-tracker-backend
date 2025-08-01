@@ -777,3 +777,46 @@ def get_commitment_time_series(db: Session, filters: CommitmentDataFilter):
         return [{"name": "Financiamento Total Agregado", "data": total_series_data}]
     else:
         return country_series
+
+
+# src/services/fund_service.py
+import csv
+from io import StringIO
+
+def stream_commitments_csv(db: Session, year: int):
+    """
+    Gera as linhas de um arquivo CSV para os compromissos de um ano específico.
+    """
+    output = StringIO()
+    writer = csv.writer(output)
+
+    # 1. Escreve o cabeçalho
+    headers = ['ID', 'Year', 'Project', 'Provider', 'Channel', 'Recipient', 'Amount (USD K)']
+    writer.writerow(headers)
+    yield output.getvalue()
+    output.seek(0)
+    output.truncate(0)
+
+    # 2. Busca os dados do banco
+    commitments = db.query(Commitment).filter(Commitment.year == year).options(
+        joinedload(Commitment.project).joinedload(Project.country),
+        joinedload(Commitment.provider),
+        joinedload(Commitment.channel),
+        joinedload(Commitment.recipient_country)
+    ).all()
+
+    # 3. Escreve os dados linha por linha
+    for c in commitments:
+        row = [
+            c.id,
+            c.year,
+            c.project.name if c.project else None,
+            c.provider.name if c.provider else None,
+            c.channel.name if c.channel else None,
+            c.recipient_country.name if c.recipient_country else None,
+            c.amount_usd_thousand
+        ]
+        writer.writerow(row)
+        yield output.getvalue()
+        output.seek(0)
+        output.truncate(0)
