@@ -137,29 +137,34 @@ class FundingEntity:
         default_factory=list,
     )
 
-
 @table_registry.mapped_as_dataclass
 class Commitment:
     __tablename__ = "commitments"
+
     id: Mapped[int] = mapped_column(primary_key=True, init=False)
-    year: Mapped[int] = mapped_column(nullable=False)
+    year: Mapped[int] = mapped_column(nullable=False, index=True)
     amount_usd_thousand: Mapped[float] = mapped_column(nullable=False)
     adaptation_amount_usd_thousand: Mapped[Optional[float]] = mapped_column(nullable=True)
     mitigation_amount_usd_thousand: Mapped[Optional[float]] = mapped_column(nullable=True)
+
+    # FKs com as regras de negócio e índices corretos
     recipient_country_id: Mapped[int] = mapped_column(
-        ForeignKey("countries.id"), default=None,
+        ForeignKey("countries.id"), index=True, default=None
     )
     provider_id: Mapped[int] = mapped_column(
-        ForeignKey("funding_entities.id"), default=None
+        ForeignKey("funding_entities.id"), index=True, default=None
     )
-    channel_id: Mapped[int] = mapped_column(
-        ForeignKey("funding_entities.id"), nullable=True, default=None
+    # CORREÇÃO: nullable=True e index=True
+    channel_id: Mapped[Optional[int]] = mapped_column(
+        ForeignKey("funding_entities.id"), nullable=True, default=None, index=True
     )
-    project_id: Mapped[int] = mapped_column(
-        ForeignKey("projects.id"), nullable=True, default=None
+    # CORREÇÃO: nullable=True e index=True
+    project_id: Mapped[Optional[int]] = mapped_column(
+        ForeignKey("projects.id"), nullable=True, default=None, index=True
     )
 
-    project: Mapped["Project"] = relationship(
+    # Relações (sem alterações)
+    project: Mapped[Optional["Project"]] = relationship(
         back_populates="commitments", init=False
     )
     provider: Mapped["FundingEntity"] = relationship(
@@ -167,14 +172,13 @@ class Commitment:
         foreign_keys=[provider_id],
         init=False,
     )
-    channel: Mapped["FundingEntity"] = relationship(
+    channel: Mapped[Optional["FundingEntity"]] = relationship(
         back_populates="commitments_as_channel",
         foreign_keys=[channel_id],
         init=False,
     )
-
     recipient_country: Mapped["Country"] = relationship(
         back_populates="commitments_as_recipient",
         foreign_keys=[recipient_country_id],
-        init=False
+        init=False,
     )

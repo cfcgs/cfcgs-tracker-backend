@@ -1,5 +1,5 @@
 from http import HTTPStatus
-from typing import Annotated
+from typing import Annotated, List
 
 from fastapi import APIRouter, Depends, UploadFile, File, HTTPException
 from sqlalchemy.orm import Session
@@ -12,7 +12,7 @@ from src.cfcgs_tracker.schemas import (
 )
 from src.services.fund_service import (
     get_commitments_data,
-    insert_commitments_from_df, get_totals_by_objective, get_commitment_time_series,
+    insert_commitments_from_df, get_totals_by_objective, get_commitment_time_series, get_distinct_commitment_years,
 )
 from src.utils.parser import read_file
 
@@ -68,3 +68,9 @@ def read_commitment_time_series(session: T_Session, filters: CommitmentDataFilte
     """Retorna dados agregados para o gráfico de evolução de financiamento."""
     time_series_data = get_commitment_time_series(session, filters)
     return {"series": time_series_data}
+
+@router.get("/years", response_model=List[int])
+def read_distinct_commitment_years(session: T_Session):
+    """Retorna uma lista de anos únicos em que ocorreram compromissos."""
+    years = get_distinct_commitment_years(session)
+    return years

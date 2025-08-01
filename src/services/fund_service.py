@@ -717,6 +717,13 @@ def get_totals_by_objective(db: Session, filters: ObjectiveDataFilter):
     return response_data
 
 
+def get_distinct_commitment_years(db: Session) -> list[int]:
+    """Retorna uma lista de anos únicos da tabela de commitments, em ordem decrescente."""
+    result = db.query(Commitment.year).distinct().order_by(Commitment.year.desc()).all()
+    # O resultado é uma lista de tuplas (ex: [(2023,), (2022,)]), então extraímos o primeiro elemento.
+    return [year[0] for year in result]
+
+
 def get_commitment_time_series(db: Session, filters: CommitmentDataFilter):
     """
     Busca e agrega os dados de compromissos por ano e país receptor,
@@ -765,6 +772,7 @@ def get_commitment_time_series(db: Session, filters: CommitmentDataFilter):
 
     # Se nenhum país específico foi filtrado, retorne apenas o total.
     # Caso contrário, retorne as séries dos países.
+
     if not filters.countries:
         return [{"name": "Financiamento Total Agregado", "data": total_series_data}]
     else:
