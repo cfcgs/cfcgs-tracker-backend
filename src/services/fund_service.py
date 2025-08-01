@@ -715,3 +715,57 @@ def get_totals_by_objective(db: Session, filters: ObjectiveDataFilter):
         )
 
     return response_data
+
+
+def get_commitment_time_series(db: Session, filters: CommitmentDataFilter):
+    """
+    Busca e agrega os dados de compromissos por ano e país receptor,
+    retornando apenas os dados necessários para o gráfico de linhas.
+    """
+    # Query base para agregar
+    query = (
+        select(
+            Commitment.year,
+            Country.name.label("country_name"),
+            func.sum(Commitment.amount_usd_thousand).label("total_amount")
+        )
+        .join(Commitment.project)
+        .join(Project.country)
+        .group_by(Commitment.year, Country.name)
+    )
+
+    if filters.years:
+        query = query.where(Commitment.year.in_(filters.years))
+    if filters.countries:
+        query = query.where(Country.id.in_(filters.countries))
+
+    result = db.execute(query).all()
+
+    # Estrutura os dados para o frontend
+    series_map = {}
+    total_map = {}
+
+    for row in result:
+        # Adiciona ao total
+        total_map[row.year] = total_map.get(row.year, 0) + row.total_amount
+
+        # Adiciona à série do país
+        if row.country_name not in series_map:
+            series_map[row.country_name] = {}
+        series_map[row.country_name][row.year] = row.total_amount
+
+    # Formata a série "Total Agregado"
+    total_series_data = [{"year": year, "amount": amount} for year, amount in total_map.items()]
+
+    # Formata as séries por país
+    country_series = [
+        {"name": country, "data": [{"year": year, "amount": amount} for year, amount in data.items()]}
+        for country, data in series_map.items()
+    ]
+
+    # Se nenhum país específico foi filtrado, retorne apenas o total.
+    # Caso contrário, retorne as séries dos países.
+    if not filters.countries:
+        return [{"name": "Financiamento Total Agregado", "data": total_series_data}]
+    else:
+        return country_series

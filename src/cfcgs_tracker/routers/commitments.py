@@ -8,11 +8,11 @@ from src.cfcgs_tracker.database.database import get_session
 from src.cfcgs_tracker.schemas import (
     CommitmentDataFilter,
     CommitmentList,
-    Message, ObjectiveTotalsList, ObjectiveDataFilter,
+    Message, ObjectiveTotalsList, ObjectiveDataFilter, TimeSeriesResponse,
 )
 from src.services.fund_service import (
     get_commitments_data,
-    insert_commitments_from_df, get_totals_by_objective,
+    insert_commitments_from_df, get_totals_by_objective, get_commitment_time_series,
 )
 from src.utils.parser import read_file
 
@@ -62,3 +62,9 @@ def upload_commitment_file(
 def read_totals_by_objective(session: T_Session, filters: ObjectiveDataFilter):
     totals_data = get_totals_by_objective(session, filters)
     return {"totals": totals_data}
+
+@router.post("/time_series", response_model=TimeSeriesResponse)
+def read_commitment_time_series(session: T_Session, filters: CommitmentDataFilter):
+    """Retorna dados agregados para o gráfico de evolução de financiamento."""
+    time_series_data = get_commitment_time_series(session, filters)
+    return {"series": time_series_data}

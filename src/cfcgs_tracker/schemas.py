@@ -150,3 +150,17 @@ class ObjectiveTotalSchema(BaseModel):
 
 class ObjectiveTotalsList(BaseModel):
     totals: List[ObjectiveTotalSchema]
+
+
+class TimeSeriesDataPoint(BaseModel):
+    year: int
+    amount: float
+
+
+class TimeSeriesData(BaseModel):
+    name: str  # Nome da série (ex: "Financiamento Total Agregado" ou "Brasil")
+    data: List[TimeSeriesDataPoint]
+
+
+class TimeSeriesResponse(BaseModel):
+    series: List[TimeSeriesData]
