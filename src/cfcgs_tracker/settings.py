@@ -17,6 +17,7 @@ class Settings(BaseSettings):
     EXPECTED_COLUMNS: str
     SIMILARITY_THRESHOLD: int
     REGIONS: str
+    GROQ_API_KEY: str
 
     @property
     def expected_columns_set(self) -> Set[str]:

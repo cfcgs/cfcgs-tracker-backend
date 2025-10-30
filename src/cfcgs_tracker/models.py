@@ -146,6 +146,7 @@ class Commitment:
     amount_usd_thousand: Mapped[float] = mapped_column(nullable=False)
     adaptation_amount_usd_thousand: Mapped[Optional[float]] = mapped_column(nullable=True)
     mitigation_amount_usd_thousand: Mapped[Optional[float]] = mapped_column(nullable=True)
+    overlap_amount_usd_thousand: Mapped[Optional[float]] = mapped_column(nullable=True)
 
     # FKs com as regras de negócio e índices corretos
     recipient_country_id: Mapped[int] = mapped_column(

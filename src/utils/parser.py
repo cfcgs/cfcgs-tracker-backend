@@ -41,14 +41,16 @@ def normalize_columns_fuzzy(
 
     if upload_type == 3:
         patterns = {
-            r"adaptation-related development finance.*commitment.*\d{4} usd thousand": "adaptation-related_development_finance_-_commitment_-_current_usd_thousand",
-            r"mitigation-related development finance.*commitment.*\d{4} usd thousand": "mitigation-related_development_finance_-_commitment_-_current_usd_thousand",
+            r"adaptation-related development finance.*commitment.*\d{4} usd thousand": "adaptation-related_development_finance_-_commitment_-_2023_usd_thousand",
+            r"mitigation-related development finance.*commitment.*\d{4} usd thousand": "mitigation-related_development_finance_-_commitment_-_2023_usd_thousand",
+            r"overlap - commitment.*\d{4} usd thousand": "overlap_-_commitment_-_2023_usd_thousand"
         }
 
         for original_col in original_columns:
             col_lower = original_col.strip().lower()
             for pattern, new_name in patterns.items():
                 if re.search(pattern, col_lower):
+                    print(col_lower, " virou " ,new_name)
                     normalized_columns[original_col] = new_name
                     break
 

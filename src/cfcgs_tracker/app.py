@@ -14,7 +14,11 @@ from src.cfcgs_tracker.routers import (
     fund_types,
     fund_focuses,
     fund_projects,
-    commitments, countries, regions,
+    commitments,
+    countries,
+    regions,
+    chatbot,
+    projects
 )
 
 
@@ -36,6 +40,7 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+app.include_router(chatbot.router)
 app.include_router(regions.router)
 app.include_router(countries.router)
 app.include_router(commitments.router)
@@ -43,6 +48,7 @@ app.include_router(funds.router)
 app.include_router(fund_types.router)
 app.include_router(fund_focuses.router)
 app.include_router(fund_projects.router)
+app.include_router(projects.router)
 
 
 @app.get("/", status_code=HTTPStatus.OK, response_model=Message)

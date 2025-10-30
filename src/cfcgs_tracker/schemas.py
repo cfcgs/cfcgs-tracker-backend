@@ -1,6 +1,6 @@
 from typing import Optional, List
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
 
 
 class Message(BaseModel):
@@ -98,7 +98,7 @@ class FundProjectList(BaseModel):
 
 
 class CommitmentDataFilter(BaseModel):
-    years: Optional[List[int]] = (None,)
+    years: Optional[List[int]] = None
     countries: Optional[List[int]] = None
 
 
@@ -146,6 +146,7 @@ class ObjectiveTotalSchema(BaseModel):
     year: int
     total_adaptation: float
     total_mitigation: float
+    total_overlap: float
 
 
 class ObjectiveTotalsList(BaseModel):
@@ -164,3 +165,56 @@ class TimeSeriesData(BaseModel):
 
 class TimeSeriesResponse(BaseModel):
     series: List[TimeSeriesData]
+
+class ChatQuery(BaseModel):
+    question: str
+
+
+class ChatResponse(BaseModel):
+    answer: str
+
+
+class KpiResponseSchema(BaseModel):
+    """Retorna os KPIs principais (Nº de Projetos, Nº de Países)."""
+    total_projects: int
+    total_funded_countries: int
+
+
+class SankeyDetailedDataSchema(BaseModel):
+    """
+    Dados detalhados para o tooltip com valores EXCLUSIVOS.
+    """
+    adaptation_exclusive: float
+    mitigation_exclusive: float
+    overlap: float
+
+
+class SankeyLinkSchema(BaseModel):
+    """
+    Define um link no diagrama Sankey, com dados de tooltip.
+    """
+    from_node: str = Field(..., alias="from")
+    to_node: str = Field(..., alias="to")
+    weight: float  # Este será o 'total_amount' (soma dos 3 exclusivos)
+    detailed_data: SankeyDetailedDataSchema
+
+
+class PaginatedSankeyResponseSchema(BaseModel):
+    """
+    Contém a lista de dados (links) para o Sankey
+    E o total de itens para o controle de paginação.
+    """
+    total_projects: int
+    data: List[SankeyLinkSchema]
+
+class ProjectSimple(BaseModel):
+    id: int
+    name: str
+
+class ProjectListResponse(BaseModel):
+    projects: List[ProjectSimple]
+
+class PaginatedProjectResponse(BaseModel):
+    projects: List[ProjectSimple]
+    total: int
+    has_more: bool

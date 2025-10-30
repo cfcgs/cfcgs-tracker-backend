@@ -1,8 +1,8 @@
 import math
-from typing import Optional
+from typing import Optional, List, Dict, Any
 
 from fastapi import HTTPException
-from sqlalchemy import func, select
+from sqlalchemy import func, select, desc, cast, String
 from sqlalchemy.orm import Session, joinedload
 from src.cfcgs_tracker.models import (
     Fund,
@@ -29,6 +29,7 @@ from src.cfcgs_tracker.schemas import (
     FundProjectSchema,
     CommitmentDataFilter,
     CommitmentDataSchema, CountrySchema, ObjectiveDataFilter, ObjectiveTotalSchema,
+    KpiResponseSchema, SankeyDetailedDataSchema, SankeyLinkSchema,
 )
 from src.utils.parser import safe_float, safe_int
 
@@ -502,12 +503,14 @@ def insert_commitments_from_df(db: Session, df: pd.DataFrame):
             channel_name = row.get("channel_of_delivery")
             year = row.get("year")
             amount_str = row.get(
-                "climate-related_development_finance_-_commitment_-_current_usd_thousand"
+                "climate-related_development_finance_-_commitment_-_2023_usd_thousand"
             )
             adaptation_amount = safe_float(
-                row.get("adaptation-related_development_finance_-_commitment_-_current_usd_thousand"))
+                row.get("adaptation-related_development_finance_-_commitment_-_2023_usd_thousand"))
             mitigation_amount = safe_float(
-                row.get("mitigation-related_development_finance_-_commitment_-_current_usd_thousand"))
+                row.get("mitigation-related_development_finance_-_commitment_-_2023_usd_thousand"))
+            overlap_amount = safe_float(
+                row.get("overlap_-_commitment_-_2023_usd_thousand"))
 
             if any(
                 pd.isna(val)
@@ -551,7 +554,8 @@ def insert_commitments_from_df(db: Session, df: pd.DataFrame):
                 year=int(year),
                 amount_usd_thousand=safe_float(amount_str),
                 adaptation_amount_usd_thousand=adaptation_amount,
-                mitigation_amount_usd_thousand=mitigation_amount
+                mitigation_amount_usd_thousand=mitigation_amount,
+                overlap_amount_usd_thousand=overlap_amount
             )
             new_commitment.project = project
             new_commitment.channel = channel_entity
@@ -687,7 +691,8 @@ def get_totals_by_objective(db: Session, filters: ObjectiveDataFilter):
         select(
             Commitment.year,
             func.sum(func.coalesce(Commitment.adaptation_amount_usd_thousand, 0)).label("total_adaptation"),
-            func.sum(func.coalesce(Commitment.mitigation_amount_usd_thousand, 0)).label("total_mitigation")
+            func.sum(func.coalesce(Commitment.mitigation_amount_usd_thousand, 0)).label("total_mitigation"),
+            func.sum(func.coalesce(Commitment.overlap_amount_usd_thousand, 0)).label("total_overlap")
         )
         .group_by(Commitment.year)
         .order_by(Commitment.year)
@@ -705,12 +710,14 @@ def get_totals_by_objective(db: Session, filters: ObjectiveDataFilter):
     for row in result:
         total_adaptation = row.total_adaptation
         total_mitigation = row.total_mitigation
+        total_overlap = row.total_overlap
 
         response_data.append(
             ObjectiveTotalSchema(
                 year=row.year,
                 total_adaptation=0 if total_adaptation is None or math.isnan(total_adaptation) else total_adaptation,
                 total_mitigation=0 if total_mitigation is None or math.isnan(total_mitigation) else total_mitigation,
+                total_overlap=0 if total_overlap is None or math.isnan(total_overlap) else total_overlap,
             )
         )
 
@@ -820,3 +827,308 @@ def stream_commitments_csv(db: Session, year: int):
         yield output.getvalue()
         output.seek(0)
         output.truncate(0)
+
+
+def get_dashboard_kpis(db: Session) -> KpiResponseSchema:
+    """Retorna os KPIs principais do dashboard."""
+
+    # KPI 1: Total de projetos (que têm financiamento)
+    total_projects_query = (
+        select(func.count(Project.id.distinct()))
+        .join(Commitment, Project.id == Commitment.project_id)
+        .filter(Commitment.amount_usd_thousand > 0)
+    )
+    total_projects = db.execute(total_projects_query).scalar_one_or_none() or 0
+
+    total_recipient_countries_query = (
+        select(func.count(Commitment.recipient_country_id.distinct()))
+        .filter(Commitment.amount_usd_thousand > 0)
+    )
+    total_funded_countries = (
+            db.execute(total_recipient_countries_query).scalar_one_or_none() or 0
+    )
+
+    return KpiResponseSchema(
+        total_projects=total_projects,
+        total_funded_countries=total_funded_countries,
+    )
+
+
+def get_paginated_sankey_data(
+        db: Session,
+        filter_years: Optional[List[int]],
+        filter_country_ids: Optional[List[int]],
+        filter_project_ids: Optional[List[int]],
+        objective: str,
+        limit: int,
+        offset: int,
+        view: str,  # 'project_country_year' ou 'project_year_country'
+) -> Dict[str, Any]:
+    """
+    Gera os links do Sankey (com detalhes) para uma "página" de projetos.
+    Estrutura: Projeto -> País -> Ano OU Projeto -> Ano -> País
+    Detalhes: com valores exclusivos do objetivo.
+    Aplica o filtro de objetivo APÓS a agregação Projeto-País-Ano.
+    """
+
+    # --- 1. Definições de Colunas (Átomos) ---
+    col_ada_raw = func.coalesce(Commitment.adaptation_amount_usd_thousand, 0)
+    col_mit_raw = func.coalesce(Commitment.mitigation_amount_usd_thousand, 0)
+    col_over_raw = func.coalesce(Commitment.overlap_amount_usd_thousand, 0)
+
+    col_ada_ex_raw = (col_ada_raw - col_over_raw).label("adaptation_exclusive")
+    col_mit_ex_raw = (col_mit_raw - col_over_raw).label("mitigation_exclusive")
+    col_total_raw = (col_ada_ex_raw + col_mit_ex_raw + col_over_raw).label(
+        "total_amount"
+    )
+
+    # --- 2. CTE 1: Todos os Commits atômicos (agregados por P-C-A) ---
+    # Sem filtro de objetivo aqui
+    base_commits_query = (
+        select(
+            Project.id.label("project_id"),
+            Project.name.label("project_name"),
+            Country.name.label("country_name"),
+            Commitment.year.label("year"),
+            # Soma os valores para criar o átomo P-C-A
+            func.sum(col_ada_ex_raw).label("sum_ada_ex"),
+            func.sum(col_mit_ex_raw).label("sum_mit_ex"),
+            func.sum(col_over_raw).label("sum_overlap"),
+            func.sum(col_total_raw).label("sum_total"),
+        )
+        .join(Project, Project.id == Commitment.project_id)
+        .join(Country, Project.country_id == Country.id)
+        .filter(Commitment.id.isnot(None))
+        .filter(col_total_raw > 0) # Mantém filtro de valor > 0
+    )
+
+    if filter_years:
+        base_commits_query = base_commits_query.filter(
+            Commitment.year.in_(filter_years)
+        )
+    if filter_project_ids:
+        base_commits_query = base_commits_query.filter(
+            Project.id.in_(filter_project_ids)
+        )
+    if filter_country_ids:
+        base_commits_query = base_commits_query.filter(
+            Project.country_id.in_(filter_country_ids)
+        )
+
+    # Agrupar no nível atômico
+    base_commits_query = base_commits_query.group_by(
+        Project.id, Project.name, Country.name, Commitment.year
+    )
+
+    aggregated_commits_cte = base_commits_query.cte("aggregated_commits")
+
+    # --- CTE 2: Aplicar filtro de objetivo *APÓS* a agregação P-C-A ---
+    objective_filtered_query = select(aggregated_commits_cte)  # Seleciona da CTE anterior
+
+    if objective == "adaptation":
+        # EXCLUSIVAMENTE Adaptação: ada > 0, mit == 0, over == 0
+        objective_filtered_query = objective_filtered_query.filter(
+            aggregated_commits_cte.c.sum_ada_ex > 0,
+            aggregated_commits_cte.c.sum_mit_ex == 0,  # Deve ser zero
+            aggregated_commits_cte.c.sum_overlap == 0
+        )
+    elif objective == "mitigation":
+        # EXCLUSIVAMENTE Mitigação: mit > 0, ada == 0, over == 0
+        objective_filtered_query = objective_filtered_query.filter(
+            aggregated_commits_cte.c.sum_mit_ex > 0,
+            aggregated_commits_cte.c.sum_ada_ex == 0,  # Deve ser zero
+            aggregated_commits_cte.c.sum_overlap == 0
+        )
+    elif objective == "both":
+        # APENAS Overlap: over > 0
+        objective_filtered_query = objective_filtered_query.filter(
+            aggregated_commits_cte.c.sum_overlap > 0
+        )
+    # Se objective == "all", nenhum filtro é aplicado aqui
+
+    # Esta CTE contém os dados P-C-A já filtrados pelo objetivo agregado EXCLUSIVO
+    objective_filtered_cte = objective_filtered_query.cte("objective_filtered_commits")
+    # --- CTE 3: Ranking de Projetos (baseado na CTE filtrada por objetivo) ---
+    project_ranking_query = (
+        select(
+            objective_filtered_cte.c.project_id,
+            objective_filtered_cte.c.project_name,
+            func.sum(objective_filtered_cte.c.sum_total).label("project_total"),
+        )
+        .select_from(objective_filtered_cte)
+        .group_by(
+            objective_filtered_cte.c.project_id,
+            objective_filtered_cte.c.project_name,
+        )
+    )
+    project_ranking_cte = project_ranking_query.cte("project_ranking")
+
+    # --- 4. Contar o total de projetos (baseado no ranking filtrado) ---
+    total_projects_query = select(func.count()).select_from(
+        project_ranking_cte
+    )
+    total_projects = (
+            db.execute(total_projects_query).scalar_one_or_none() or 0
+    )
+
+    # Se nenhum projeto passar no filtro de objetivo, retorna vazio
+    if total_projects == 0:
+        return {"total_projects": 0, "data": []}
+
+    # --- CTE 4: Pegar a PÁGINA de Projetos (baseado no ranking filtrado) ---
+    paginated_projects_query = (
+        select(
+            project_ranking_cte.c.project_id,
+            project_ranking_cte.c.project_name,
+        )
+        .order_by(desc(project_ranking_cte.c.project_total))
+        .limit(limit)
+        .offset(offset)
+    )
+    paginated_projects_cte = paginated_projects_query.cte(
+        "paginated_projects"
+    )
+
+    # --- CTE 5: Dados Base do Sankey (junta os P-C-A dos projetos da página *já filtrados por objetivo*) ---
+    sankey_base_data_query = select(objective_filtered_cte).join( # Seleciona da CTE filtrada por objetivo
+        paginated_projects_cte,
+        objective_filtered_cte.c.project_id # Junta usando a CTE filtrada por objetivo
+        == paginated_projects_cte.c.project_id,
+    )
+    sankey_base_data_cte = sankey_base_data_query.cte("sankey_base_data")
+
+    # --- 7. Definições de Colunas para SOMA FINAL (baseado na CTE final) ---
+    col_total = func.sum(sankey_base_data_cte.c.sum_total).label("total_amount")
+    col_ada_ex = func.sum(sankey_base_data_cte.c.sum_ada_ex).label(
+        "adaptation_exclusive"
+    )
+    col_mit_ex = func.sum(sankey_base_data_cte.c.sum_mit_ex).label(
+        "mitigation_exclusive"
+    )
+    col_over = func.sum(sankey_base_data_cte.c.sum_overlap).label("overlap")
+
+    # --- 8. Gerar os 2 conjuntos de links do Sankey (baseado na View e na CTE final) ---
+    if view == "project_country_year":
+        # Link 1: Projeto -> País
+        links_1 = select(
+            sankey_base_data_cte.c.project_name.label("from_node"),
+            sankey_base_data_cte.c.country_name.label("to_node"),
+            col_total, col_ada_ex, col_mit_ex, col_over,
+        ).group_by(
+            sankey_base_data_cte.c.project_name, sankey_base_data_cte.c.country_name
+        )
+
+        # Link 2: País -> Ano
+        links_2 = select(
+            sankey_base_data_cte.c.country_name.label("from_node"),
+            cast(sankey_base_data_cte.c.year, String).label("to_node"), # Mantém cast para String
+            col_total, col_ada_ex, col_mit_ex, col_over,
+        ).group_by(sankey_base_data_cte.c.country_name, sankey_base_data_cte.c.year)
+
+    elif view == "project_year_country":
+        # Link 1: Projeto -> Ano
+        links_1 = select(
+            sankey_base_data_cte.c.project_name.label("from_node"),
+            cast(sankey_base_data_cte.c.year, String).label("to_node"), # Mantém cast para String
+            col_total, col_ada_ex, col_mit_ex, col_over,
+        ).group_by(sankey_base_data_cte.c.project_name, sankey_base_data_cte.c.year)
+
+        # Link 2: Ano -> País
+        links_2 = select(
+            cast(sankey_base_data_cte.c.year, String).label("from_node"), # Mantém cast para String
+            sankey_base_data_cte.c.country_name.label("to_node"),
+            col_total, col_ada_ex, col_mit_ex, col_over,
+        ).group_by(sankey_base_data_cte.c.year, sankey_base_data_cte.c.country_name)
+
+    else:
+        raise HTTPException(status_code=400, detail="Visualização (view) inválida.")
+
+    # --- 9. Unir tudo e executar ---
+    final_query = links_1.union_all(links_2)
+    results = db.execute(final_query).all()
+
+    # --- 10. Formatar a saída (sem alterações) ---
+    sankey_links = []
+    for row in results:
+        # Usar ._mapping para acessar colunas pelo nome do label
+        row_dict = row._mapping
+        if row_dict.get("total_amount") and row_dict["total_amount"] > 0:
+            detailed_data = SankeyDetailedDataSchema(
+                # Acessa usando os labels definidos nas colunas da query final
+                adaptation_exclusive=row_dict.get("adaptation_exclusive", 0.0) or 0.0,
+                mitigation_exclusive=row_dict.get("mitigation_exclusive", 0.0) or 0.0,
+                overlap=row_dict.get("overlap", 0.0) or 0.0,
+            )
+            link_data_dict = {
+                "from": row_dict.get("from_node"),
+                "to": row_dict.get("to_node"),
+                "weight": row_dict.get("total_amount"),
+                "detailed_data": detailed_data,
+            }
+            try:
+                link = SankeyLinkSchema.model_validate(link_data_dict)
+                sankey_links.append(link)
+            except Exception as e:
+                print(f"Erro de validação Pydantic: {e} para dados {link_data_dict}")
+                continue
+
+    # --- Retorna o objeto esperado pelo frontend ---
+    return {"total_projects": total_projects, "data": sankey_links}
+
+
+def get_commitment_projects(db: Session) -> list[dict]:
+    """Retorna uma lista de projetos (id, name) que possuem pelo menos um compromisso."""
+
+    # Esta query busca IDs e Nomes distintos de Projetos
+    # que têm uma correspondência na tabela de Compromissos (Commitment).
+    query = (
+        select(Project.id, Project.name)
+        .join(Commitment, Project.id == Commitment.project_id)
+        .distinct()
+        .order_by(Project.name)
+    )
+
+    results = db.execute(query).all()
+
+    # Converte a lista de (Row) para uma lista de dicts
+    return [{"id": row.id, "name": row.name} for row in results]
+
+async def get_paginated_commitment_projects(
+    db: Session,
+    search: Optional[str] = None,
+    limit: int = 20,
+    offset: int = 0
+) -> Dict[str, Any]:
+    """
+    Busca projetos (que têm compromissos) de forma paginada,
+    com filtro de busca opcional.
+    """
+
+    # Query base: Projetos distintos que estão em Commitments
+    base_query = (
+        select(Project.id, Project.name)
+        .join(Commitment, Project.id == Commitment.project_id)
+        .distinct()
+    )
+
+    if search:
+        # Adiciona filtro (case-insensitive)
+        base_query = base_query.filter(Project.name.ilike(f"%{search}%"))
+
+    # Clona a query base para fazer a contagem total (sem limit/offset)
+    count_query = select(func.count()).select_from(base_query.alias())
+    total = db.execute(count_query).scalar_one_or_none() or 0
+
+    # Aplica ordenação, paginação e executa
+    paginated_query = base_query.order_by(Project.name).limit(limit).offset(offset)
+    results = db.execute(paginated_query).all()
+
+    projects = [{"id": row.id, "name": row.name} for row in results]
+
+    return {
+        "projects": projects,
+        "total": total,
+        "limit": limit,
+        "offset": offset,
+        "has_more": (offset + len(projects)) < total
+    }

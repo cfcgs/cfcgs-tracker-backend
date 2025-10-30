@@ -1,7 +1,8 @@
+from enum import Enum
 from http import HTTPStatus
-from typing import Annotated, List
+from typing import Annotated, List, Optional
 
-from fastapi import APIRouter, Depends, UploadFile, File, HTTPException
+from fastapi import APIRouter, Depends, UploadFile, File, HTTPException, Query
 from fastapi.responses import StreamingResponse
 from sqlalchemy.orm import Session
 
@@ -10,11 +11,12 @@ from src.cfcgs_tracker.schemas import (
     CommitmentDataFilter,
     CommitmentList,
     Message, ObjectiveTotalsList, ObjectiveDataFilter, TimeSeriesResponse,
+    PaginatedSankeyResponseSchema, KpiResponseSchema,
 )
 from src.services.fund_service import (
     get_commitments_data,
     insert_commitments_from_df, get_totals_by_objective, get_commitment_time_series, get_distinct_commitment_years,
-    stream_commitments_csv,
+    stream_commitments_csv, get_paginated_sankey_data, get_dashboard_kpis,
 )
 from src.utils.parser import read_file
 
@@ -22,6 +24,17 @@ router = APIRouter(prefix="/commitments", tags=["commitments"])
 
 T_Session = Annotated[Session, Depends(get_session)]
 
+
+class ObjectiveFilter(str, Enum):
+    all = "all"
+    adaptation = "adaptation"
+    mitigation = "mitigation"
+    both = "both"
+
+
+class SankeyView(str, Enum):
+    project_country_year = "project_country_year"
+    project_year_country = "project_year_country"
 
 @router.post("/", response_model=CommitmentList)
 def read_commitments(
@@ -77,7 +90,6 @@ def read_distinct_commitment_years(session: T_Session):
     years = get_distinct_commitment_years(session)
     return years
 
-
 @router.get("/export/{year}", response_class=StreamingResponse)
 def export_commitments_by_year(year: int, session: T_Session):
     """
@@ -94,3 +106,72 @@ def export_commitments_by_year(year: int, session: T_Session):
         media_type="text/csv",
         headers=headers
     )
+
+@router.get(
+    "/kpis",
+    response_model=KpiResponseSchema,
+    status_code=HTTPStatus.OK
+)
+def get_kpis(session: T_Session):
+    """
+    Retorna os KPIs principais (Nº de Projetos, Nº de Países).
+    """
+    try:
+        return get_dashboard_kpis(session)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get(
+    "/sankey_data",
+    response_model=PaginatedSankeyResponseSchema,
+    status_code=HTTPStatus.OK,
+)
+def get_sankey_diagram_data(
+    session: T_Session,
+    # --- Filtros ---
+    years: Optional[List[int]] = Query(
+        None, alias="year", description="Filtra por um ou mais anos"
+    ),
+    country_ids: Optional[List[int]] = Query(
+        None, alias="country_id", description="Filtra por um ou mais IDs de países"
+    ),
+    project_ids: Optional[List[int]] = Query(
+        None, alias="project_id", description="Filtra por um ou mais IDs de projetos"
+    ),
+    objective: ObjectiveFilter = Query(
+        ObjectiveFilter.all,
+        description="Filtra por objetivo do financiamento (padrão: 'all')",
+    ),
+    # --- Paginação ---
+    limit: int = Query(
+        5, description="Nº de projetos por página", ge=1, le=20
+    ),
+    offset: int = Query(0, description="Nº de projetos a pular", ge=0),
+    # --- Controle de View ---
+    view: SankeyView = Query(
+        SankeyView.project_country_year,
+        description="Define a ordem dos nós: 'project_country_year' (Padrão) ou 'project_year_country'",
+    ),
+):
+    """
+    Retorna os dados [from, to, weight, tooltip] para o diagrama Sankey.
+    Os dados são PAGINADOS com base no ranking de 'total_amount' dos PROJETOS.
+    Permite duas visões: Projeto->País->Ano ou Projeto->Ano->País.
+    """
+    try:
+        sankey_page_data = get_paginated_sankey_data(
+            session,
+            filter_years=years,
+            filter_country_ids=country_ids,
+            filter_project_ids=project_ids,
+            objective=objective.value,
+            limit=limit,
+            offset=offset,
+            view=view.value,
+        )
+        return sankey_page_data
+    except Exception as e:
+        raise HTTPException(
+            status_code=500, detail=f"Ocorreu um erro ao buscar os dados: {str(e)}"
+        )
