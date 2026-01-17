@@ -11,12 +11,13 @@ from src.cfcgs_tracker.schemas import (
     CommitmentDataFilter,
     CommitmentList,
     Message, ObjectiveTotalsList, ObjectiveDataFilter, TimeSeriesResponse,
-    PaginatedSankeyResponseSchema, KpiResponseSchema,
+    HeatmapResponseSchema, HeatmapProjectsResponseSchema, KpiResponseSchema,
 )
 from src.services.fund_service import (
     get_commitments_data,
     insert_commitments_from_df, get_totals_by_objective, get_commitment_time_series, get_distinct_commitment_years,
-    stream_commitments_csv, get_paginated_sankey_data, get_dashboard_kpis,
+    stream_commitments_csv, get_heatmap_data, get_heatmap_cell_projects,
+    get_dashboard_kpis,
 )
 from src.utils.parser import read_file
 
@@ -32,9 +33,9 @@ class ObjectiveFilter(str, Enum):
     both = "both"
 
 
-class SankeyView(str, Enum):
-    project_country_year = "project_country_year"
-    project_year_country = "project_year_country"
+class HeatmapView(str, Enum):
+    country_year = "country_year"
+    year_country = "year_country"
 
 @router.post("/", response_model=CommitmentList)
 def read_commitments(
@@ -123,54 +124,85 @@ def get_kpis(session: T_Session):
 
 
 @router.get(
-    "/sankey_data",
-    response_model=PaginatedSankeyResponseSchema,
+    "/heatmap_data",
+    response_model=HeatmapResponseSchema,
     status_code=HTTPStatus.OK,
 )
-def get_sankey_diagram_data(
+def get_heatmap_diagram_data(
     session: T_Session,
-    # --- Filtros ---
     years: Optional[List[int]] = Query(
         None, alias="year", description="Filtra por um ou mais anos"
     ),
     country_ids: Optional[List[int]] = Query(
-        None, alias="country_id", description="Filtra por um ou mais IDs de países"
+        None, alias="country_id", description="Filtra por um ou mais IDs de paises"
     ),
     project_ids: Optional[List[int]] = Query(
         None, alias="project_id", description="Filtra por um ou mais IDs de projetos"
     ),
     objective: ObjectiveFilter = Query(
         ObjectiveFilter.all,
-        description="Filtra por objetivo do financiamento (padrão: 'all')",
+        description="Filtra por objetivo do financiamento (padrao: 'all')",
     ),
-    # --- Paginação ---
-    limit: int = Query(
-        5, description="Nº de projetos por página", ge=1, le=20
+    view: HeatmapView = Query(
+        HeatmapView.country_year,
+        description="Define a ordem dos eixos: 'country_year' (Padrao) ou 'year_country'",
     ),
-    offset: int = Query(0, description="Nº de projetos a pular", ge=0),
-    # --- Controle de View ---
-    view: SankeyView = Query(
-        SankeyView.project_country_year,
-        description="Define a ordem dos nós: 'project_country_year' (Padrão) ou 'project_year_country'",
-    ),
+    row_offset: int = Query(0, description="Deslocamento de linhas", ge=0),
+    row_limit: int = Query(30, description="Quantidade de linhas por janela", ge=1, le=200),
+    column_offset: int = Query(0, description="Deslocamento de colunas", ge=0),
+    column_limit: int = Query(30, description="Quantidade de colunas por janela", ge=1, le=200),
 ):
     """
-    Retorna os dados [from, to, weight, tooltip] para o diagrama Sankey.
-    Os dados são PAGINADOS com base no ranking de 'total_amount' dos PROJETOS.
-    Permite duas visões: Projeto->País->Ano ou Projeto->Ano->País.
+    Retorna dados agregados para o heatmap (ano x pais), com totais e percentuais.
     """
     try:
-        sankey_page_data = get_paginated_sankey_data(
+        heatmap_data = get_heatmap_data(
             session,
             filter_years=years,
             filter_country_ids=country_ids,
             filter_project_ids=project_ids,
             objective=objective.value,
+            view=view.value,
+            row_offset=row_offset,
+            row_limit=row_limit,
+            column_offset=column_offset,
+            column_limit=column_limit,
+        )
+        return heatmap_data
+    except Exception as e:
+        raise HTTPException(
+            status_code=500, detail=f"Ocorreu um erro ao buscar os dados: {str(e)}"
+        )
+
+
+@router.get(
+    "/heatmap_projects",
+    response_model=HeatmapProjectsResponseSchema,
+    status_code=HTTPStatus.OK,
+)
+def get_heatmap_projects(
+    session: T_Session,
+    year: int = Query(..., description="Ano da celula selecionada"),
+    country_id: int = Query(..., description="ID do pais da celula selecionada"),
+    objective: ObjectiveFilter = Query(
+        ObjectiveFilter.all,
+        description="Filtra por objetivo do financiamento (padrao: 'all')",
+    ),
+    limit: int = Query(20, description="Nº de projetos por pagina", ge=1, le=200),
+    offset: int = Query(0, description="Nº de projetos a pular", ge=0),
+):
+    """
+    Retorna projetos paginados para uma celula (ano x pais).
+    """
+    try:
+        return get_heatmap_cell_projects(
+            session,
+            year=year,
+            country_id=country_id,
+            objective=objective.value,
             limit=limit,
             offset=offset,
-            view=view.value,
         )
-        return sankey_page_data
     except Exception as e:
         raise HTTPException(
             status_code=500, detail=f"Ocorreu um erro ao buscar os dados: {str(e)}"

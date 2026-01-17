@@ -1,6 +1,6 @@
-from typing import Optional, List
+from typing import Optional, List, Dict, Any
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict
 
 
 class Message(BaseModel):
@@ -168,10 +168,30 @@ class TimeSeriesResponse(BaseModel):
 
 class ChatQuery(BaseModel):
     question: str
+    session_id: Optional[str] = "default"
+    page: int = 1
+    page_size: int = 10
+    confirm_pagination: bool = False
+
+
+class PaginationResult(BaseModel):
+    page: int
+    page_size: int
+    total_rows: int
+    has_more: bool
+    rows: List[Dict[str, Any]]
+
+
+class ChatSource(BaseModel):
+    name: str
+    url: str
 
 
 class ChatResponse(BaseModel):
     answer: str
+    needs_pagination_confirmation: bool = False
+    pagination: Optional[PaginationResult] = None
+    sources: Optional[List[ChatSource]] = None
 
 
 class KpiResponseSchema(BaseModel):
@@ -180,32 +200,62 @@ class KpiResponseSchema(BaseModel):
     total_funded_countries: int
 
 
-class SankeyDetailedDataSchema(BaseModel):
-    """
-    Dados detalhados para o tooltip com valores EXCLUSIVOS.
-    """
+class HeatmapCellSchema(BaseModel):
+    year: int
+    country_id: int
+    country_name: str
+    row_label: str
+    column_label: str
+    total_amount: float
+    adaptation_exclusive: float
+    mitigation_exclusive: float
+    overlap: float
+    project_count: int
+    percent_of_total: float
+    percent_of_row: float
+    percent_of_column: float
+
+
+class HeatmapAxisTotalSchema(BaseModel):
+    label: str
+    total_amount: float
+    project_count: int
+    percent_of_total: float
+    country_id: Optional[int] = None
+    year: Optional[int] = None
+
+
+class HeatmapResponseSchema(BaseModel):
+    view: str
+    rows: List[str]
+    columns: List[str]
+    row_totals: List[HeatmapAxisTotalSchema]
+    column_totals: List[HeatmapAxisTotalSchema]
+    cells: List[HeatmapCellSchema]
+    grand_total: float
+    grand_total_projects: int
+    row_count: int
+    column_count: int
+    row_offset: int
+    column_offset: int
+    row_limit: int
+    column_limit: int
+
+
+class HeatmapProjectSchema(BaseModel):
+    id: int
+    name: str
+    objective: str
+    total_amount: float
     adaptation_exclusive: float
     mitigation_exclusive: float
     overlap: float
 
 
-class SankeyLinkSchema(BaseModel):
-    """
-    Define um link no diagrama Sankey, com dados de tooltip.
-    """
-    from_node: str = Field(..., alias="from")
-    to_node: str = Field(..., alias="to")
-    weight: float  # Este será o 'total_amount' (soma dos 3 exclusivos)
-    detailed_data: SankeyDetailedDataSchema
-
-
-class PaginatedSankeyResponseSchema(BaseModel):
-    """
-    Contém a lista de dados (links) para o Sankey
-    E o total de itens para o controle de paginação.
-    """
-    total_projects: int
-    data: List[SankeyLinkSchema]
+class HeatmapProjectsResponseSchema(BaseModel):
+    total: int
+    has_more: bool
+    projects: List[HeatmapProjectSchema]
 
 class ProjectSimple(BaseModel):
     id: int
