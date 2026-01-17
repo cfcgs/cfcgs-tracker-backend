@@ -68,7 +68,7 @@ class Project:
         ForeignKey("funds.id"), default=None, nullable=True
     )
     country_id: Mapped[int] = mapped_column(
-        ForeignKey("countries.id"), default=None
+        ForeignKey("countries.id"), default=None, nullable=True
     )
 
     fund: Mapped["Fund"] = relationship(

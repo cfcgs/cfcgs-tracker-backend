@@ -17,5 +17,11 @@ def ask_chatbot(query: ChatQuery, session: T_Session):
     Recebe uma pergunta do frontend, passa para o agente e retorna a resposta.
     """
     agent = ClimateDataAgent(db_session=session)
-    answer = agent.run(question=query.question)
-    return {"answer": answer}
+    answer_payload = agent.run(
+        question=query.question,
+        session_id=query.session_id,
+        page=query.page,
+        page_size=query.page_size,
+        confirm_pagination=query.confirm_pagination,
+    )
+    return answer_payload
