@@ -4,6 +4,7 @@ import operator
 import re
 import time
 import unicodedata
+from difflib import SequenceMatcher
 from typing import TypedDict, Annotated, List, Optional, Dict, Any
 
 from langchain_community.utilities import SQLDatabase
@@ -58,6 +59,7 @@ class PaginationState(TypedDict, total=False):
 class ConversationState(TypedDict, total=False):
     history: List[BaseMessage]
     pagination_request: Optional[PaginationState]
+    disambiguation_request: Optional[Dict[str, Any]]
     last_rows: List[Dict[str, Any]]
     last_question: Optional[str]
     last_query: Optional[str]
@@ -344,6 +346,11 @@ _GEO_COUNTRY_PHRASE_PATTERN = re.compile(
     r"(?P<name>[\wÀ-ÿ][\wÀ-ÿ\s.\-]*?(?:,\s*[\wÀ-ÿ][\wÀ-ÿ\s.\-]*|\bregional\b))",
     re.IGNORECASE,
 )
+_GEO_SIMPLE_PATTERN = re.compile(
+    r"(?:\bpara\b|\bpara\s+a\b|\bpara\s+o\b|\bem\b|\bna\b|\bno\b|\bnos\b|\bnas\b|\bà\b|\bao\b)\s+"
+    r"(?P<name>[\wÀ-ÿ][\wÀ-ÿ.\-]*(?:\s+[\wÀ-ÿ][\wÀ-ÿ.\-]*){0,3})",
+    re.IGNORECASE,
+)
 _EXPLICIT_COUNTRY_PATTERN = re.compile(r"\bpa[ií]s\b\s*'([^']+)'", re.IGNORECASE)
 _EXPLICIT_REGION_PATTERN = re.compile(r"\bregi[aã]o\b\s*'([^']+)'", re.IGNORECASE)
 _COUNT_DISTINCT_PROJECT_PATTERN = re.compile(
@@ -562,6 +569,40 @@ class ClimateDataAgent:
             "ou filtrar por tema."
         )
 
+    def _needs_scope_disambiguation(self, question: str, session_id: str) -> bool:
+        normalized = question.strip().lower()
+        if not normalized:
+            return False
+        if "projeto" not in normalized and "projetos" not in normalized:
+            return False
+        if self._extract_geo_mentions(question):
+            return False
+        if not (
+            normalized.startswith("o que")
+            or "o que" in normalized
+            or "para que" in normalized
+            or "como funcionam" in normalized
+            or "o que fazem" in normalized
+        ):
+            return False
+        entities = self._extract_recent_entities(session_id)
+        return bool(entities)
+
+    def _build_scope_disambiguation_payload(self, session_id: str) -> Dict[str, object]:
+        entities = self._extract_recent_entities(session_id)
+        context_hint = self._select_entity_for_question("projetos", entities) or "contexto anterior"
+        return {
+            "message": (
+                "Sua pergunta pode ser geral ou relacionada ao contexto anterior. "
+                "Como você prefere?"
+            ),
+            "options": [
+                {"name": "Geral (explicação sobre projetos)", "kind": "scope_general"},
+                {"name": f"Usar contexto anterior ({context_hint})", "kind": "scope_context"},
+            ],
+            "mode": "select",
+        }
+
     def _normalize_entity_value(self, value: object) -> str:
         if value is None:
             return ""
@@ -688,20 +729,44 @@ class ClimateDataAgent:
         normalized = unicodedata.normalize("NFKD", value)
         return "".join(char for char in normalized if not unicodedata.combining(char))
 
+    def _normalize_geo_key(self, value: str) -> str:
+        if not value:
+            return ""
+        text = self._strip_accents(value).lower()
+        text = re.sub(r"[^\w\s,/-]", "", text)
+        text = re.sub(r"\s+", " ", text).strip()
+        return text
+
+    def _clean_geo_mention(self, value: str) -> str:
+        if not value:
+            return value
+        cleaned = value.strip(" ?!.")
+        cleaned = re.sub(
+            r"^(?:a|o|os|as|ao|aos|à|às|na|no|nas|nos|de|do|da|dos|das|the)\s+",
+            "",
+            cleaned,
+            flags=re.IGNORECASE,
+        )
+        return cleaned.strip()
+
     def _extract_geo_mentions(self, question: str) -> List[str]:
         if not question:
             return []
         mentions: List[str] = []
         for match in _GEO_COMMA_PATTERN.finditer(question):
-            name = match.group("name").strip(" ?!.")
+            name = self._clean_geo_mention(match.group("name"))
             if name:
                 mentions.append(name)
         for match in _GEO_REGIONAL_PATTERN.finditer(question):
-            name = match.group("name").strip(" ?!.")
+            name = self._clean_geo_mention(match.group("name"))
             if name and name not in mentions:
                 mentions.append(name)
         for match in _GEO_COUNTRY_PHRASE_PATTERN.finditer(question):
-            name = match.group("name").strip(" ?!.")
+            name = self._clean_geo_mention(match.group("name"))
+            if name and name not in mentions:
+                mentions.append(name)
+        for match in _GEO_SIMPLE_PATTERN.finditer(question):
+            name = self._clean_geo_mention(match.group("name"))
             if name and name not in mentions:
                 mentions.append(name)
         return mentions
@@ -723,12 +788,14 @@ class ClimateDataAgent:
             for idx, variant in enumerate(variants):
                 param_key = f"t{idx}"
                 params[param_key] = f"%{variant}%" if wildcard else variant
-                clauses.append(f"name ILIKE :{param_key}")
+                clauses.append(f"vcd.country_name ILIKE :{param_key}")
             where_clause = " OR ".join(clauses)
             sql = f"""
-                SELECT 'region' AS kind, name FROM regions WHERE {where_clause}
-                UNION ALL
-                SELECT 'country' AS kind, name FROM countries WHERE {where_clause}
+                SELECT DISTINCT 'country' AS kind, vcd.country_name AS name
+                FROM view_commitments_detailed vcd
+                WHERE vcd.country_name IS NOT NULL
+                  AND vcd.country_name <> ''
+                  AND ({where_clause})
                 LIMIT 10
             """
             try:
@@ -742,9 +809,85 @@ class ClimateDataAgent:
         matches = run_lookup(False)
         if matches:
             return matches
-        return run_lookup(True)
+        matches = run_lookup(True)
+        if matches:
+            return matches
+        return self._fuzzy_lookup_geo_candidates(cleaned)
 
-    def _apply_geo_disambiguation(self, question: str) -> tuple[str, Optional[str]]:
+    def _fuzzy_lookup_geo_candidates(self, term: str) -> List[Dict[str, str]]:
+        normalized_term = self._normalize_geo_key(term)
+        if not normalized_term:
+            return []
+        sql = """
+            SELECT DISTINCT 'country' AS kind, vcd.country_name AS name
+            FROM view_commitments_detailed vcd
+            WHERE vcd.country_name IS NOT NULL
+              AND vcd.country_name <> ''
+        """
+        try:
+            result = self.db_session.execute(text(sql))
+            candidates = []
+            for kind, name in result.fetchall():
+                normalized_name = self._normalize_geo_key(name)
+                if not normalized_name:
+                    continue
+                score = SequenceMatcher(None, normalized_term, normalized_name).ratio()
+                if score >= 0.6:
+                    candidates.append({"kind": kind, "name": name, "score": score})
+            candidates.sort(key=lambda item: item["score"], reverse=True)
+            return [{"kind": item["kind"], "name": item["name"]} for item in candidates[:5]]
+        except Exception as exc:
+            print(f"--- Falha ao buscar nomes geográficos (fuzzy): {exc} ---")
+            self.db_session.rollback()
+            return []
+
+    def _build_geo_disambiguation_payload(
+        self,
+        mention: str,
+        matches: List[Dict[str, str]],
+        mode: str,
+    ) -> Dict[str, object]:
+        options = [{"name": item["name"], "kind": "country"} for item in matches]
+        options_text = ", ".join(item["name"] for item in matches)
+        if mode == "confirm":
+            message = (
+                f"Encontrei um nome de país semelhante a '{mention}': {options_text}. "
+                "Você quer usar essa opção?"
+            )
+        else:
+            message = (
+                f"Encontrei opções de nomes de países semelhantes a '{mention}': {options_text}. "
+                "Selecione a opção correta."
+            )
+        return {
+            "message": message,
+            "options": options,
+            "mode": mode,
+        }
+
+    def _apply_geo_choice(
+        self,
+        question: str,
+        mention: str,
+        choice: Dict[str, str],
+    ) -> str:
+        if not question or not mention or not choice:
+            return question
+        canonical = choice.get("name")
+        if not canonical:
+            return question
+        escaped = canonical.replace("'", "''")
+        quoted = f"'{escaped}'"
+        replacement = f"país {quoted}"
+        article_pattern = re.compile(
+            rf"\b(?:a|o|os|as|ao|aos|à|às)\s+{re.escape(mention)}",
+            re.IGNORECASE,
+        )
+        if article_pattern.search(question):
+            return article_pattern.sub(replacement, question, count=1)
+        return self._replace_case_insensitive(question, mention, replacement)
+
+    def _apply_geo_disambiguation(self, question: str) -> tuple[str, Optional[Dict[str, object]]]:
         mentions = self._extract_geo_mentions(question)
         if not mentions:
             return question, None
@@ -754,65 +897,23 @@ class ClimateDataAgent:
             matches = self._lookup_geo_candidates(mention)
             if not matches:
                 continue
-            explicit_region = re.search(
-                rf"\bregi[aã]o\s+{re.escape(mention)}|\bregion\s+{re.escape(mention)}",
-                updated_question,
-                re.IGNORECASE,
-            )
-            explicit_country = re.search(
-                rf"\bpa[ií]s\s+{re.escape(mention)}|\bcountry\s+{re.escape(mention)}",
-                updated_question,
-                re.IGNORECASE,
-            )
-
-            if explicit_region:
-                matches = [item for item in matches if item["kind"] == "region"]
-            elif explicit_country:
-                matches = [item for item in matches if item["kind"] == "country"]
-            else:
-                country_matches = [item for item in matches if item["kind"] == "country"]
-                if country_matches:
-                    matches = country_matches
-                else:
-                    matches = [item for item in matches if item["kind"] == "region"]
-
-            if not matches:
-                continue
 
             if len(matches) == 1:
-                canonical = matches[0]["name"]
-                kind = matches[0]["kind"]
-                quoted = f"'{canonical}'"
-                if quoted in updated_question or f"\"{canonical}\"" in updated_question:
-                    continue
-                needs_prefix = False
-                if kind == "region":
-                    needs_prefix = not re.search(
-                        rf"\bregi[aã]o\s+{re.escape(mention)}",
-                        updated_question,
-                        re.IGNORECASE,
-                    )
-                    replacement = f"região {quoted}" if needs_prefix else quoted
-                else:
-                    needs_prefix = not re.search(
-                        rf"\bpa[ií]s\s+{re.escape(mention)}",
-                        updated_question,
-                        re.IGNORECASE,
-                    )
-                    replacement = f"país {quoted}" if needs_prefix else quoted
+                payload = self._build_geo_disambiguation_payload(
+                    mention=mention,
+                    matches=matches,
+                    mode="confirm",
+                )
+                payload["mention"] = mention
+                return updated_question, payload
 
-                updated_question = self._replace_case_insensitive(updated_question, mention, replacement)
-                continue
-
-            options = ", ".join(
-                f"{item['name']} ({'região' if item['kind'] == 'region' else 'país'})"
-                for item in matches
+            payload = self._build_geo_disambiguation_payload(
+                mention=mention,
+                matches=matches,
+                mode="select",
             )
-            response = (
-                f"Encontrei mais de um nome semelhante a '{mention}': {options}. "
-                "Qual deles você quer consultar?"
-            )
-            return updated_question, response
+            payload["mention"] = mention
+            return updated_question, payload
 
         return updated_question, None
 
@@ -1198,6 +1299,7 @@ class ClimateDataAgent:
         page: int = 1,
         page_size: int = 10,
         confirm_pagination: bool = False,
+        disambiguation_choice: Optional[Dict[str, str]] = None,
     ) -> Dict[str, object]:
         """
         Executa a pergunta do usuário orquestrando as cadeias LCEL.
@@ -1213,9 +1315,47 @@ class ClimateDataAgent:
         pagination_payload = None
         needs_confirmation = False
         response_sources: Optional[List[Dict[str, str]]] = None
+        response_disambiguation: Optional[Dict[str, object]] = None
 
         page = max(1, page)
         page_size = max(1, min(page_size, 50))
+
+        skip_geo_disambiguation = False
+        skip_scope_disambiguation = False
+        pending_disambiguation = state.get("disambiguation_request")
+        if pending_disambiguation and not disambiguation_choice:
+            pending_question = pending_disambiguation.get("question")
+            if pending_question and pending_question != question:
+                state["disambiguation_request"] = None
+                pending_disambiguation = None
+        if disambiguation_choice and pending_disambiguation:
+            if pending_disambiguation.get("type") == "geo":
+                question = self._apply_geo_choice(
+                    pending_disambiguation.get("question", question),
+                    pending_disambiguation.get("mention", ""),
+                    disambiguation_choice,
+                )
+                skip_geo_disambiguation = True
+            elif pending_disambiguation.get("type") == "scope":
+                choice_kind = disambiguation_choice.get("kind")
+                if choice_kind == "scope_general":
+                    final_output = self._answer_general_project_followup()
+                    response_disambiguation = None
+                    state["disambiguation_request"] = None
+                    updated_history = chat_history + [HumanMessage(content=question), AIMessage(content=final_output)]
+                    state["history"] = updated_history[-10:]
+                    print(f"--- Resposta Final para o Usuário: {final_output} ---")
+                    return {
+                        "answer": final_output,
+                        "needs_pagination_confirmation": False,
+                        "pagination": None,
+                        "sources": None,
+                        "disambiguation": None,
+                    }
+                if choice_kind == "scope_context":
+                    question = pending_disambiguation.get("question", question)
+                    skip_scope_disambiguation = True
+            state["disambiguation_request"] = None
 
         pending = state.get("pagination_request")
         is_confirmation_flow = bool(
@@ -1269,6 +1409,15 @@ class ClimateDataAgent:
                     final_output = (
                         "Para continuar, indique o nome do projeto, país ou fundo a que você se refere."
                     )
+                elif not skip_scope_disambiguation and self._needs_scope_disambiguation(resolved_question, session_id):
+                    response_disambiguation = self._build_scope_disambiguation_payload(session_id)
+                    response_disambiguation["type"] = "scope"
+                    response_disambiguation["question"] = resolved_question
+                    final_output = response_disambiguation["message"]
+                    state["disambiguation_request"] = {
+                        "type": "scope",
+                        "question": resolved_question,
+                    }
                 elif self._is_general_project_followup(resolved_question):
                     final_output = self._answer_general_project_followup()
                 elif self._is_general_finance_question(resolved_question):
@@ -1289,11 +1438,47 @@ class ClimateDataAgent:
                     standalone_question = self._resolve_manual_references(
                         standalone_question, session_id
                     )
-                    standalone_question, disambiguation_response = self._apply_geo_disambiguation(
-                        standalone_question
-                    )
-                    if disambiguation_response:
-                        final_output = disambiguation_response
+                    if not skip_geo_disambiguation:
+                        standalone_question, disambiguation_response = self._apply_geo_disambiguation(
+                            standalone_question
+                        )
+                        if disambiguation_response:
+                            response_disambiguation = disambiguation_response
+                            response_disambiguation["type"] = "geo"
+                            response_disambiguation["question"] = standalone_question
+                            response_disambiguation["mention"] = disambiguation_response.get("mention")
+                            final_output = disambiguation_response["message"]
+                            state["disambiguation_request"] = {
+                                "type": "geo",
+                                "question": standalone_question,
+                                "mention": disambiguation_response.get("mention", ""),
+                            }
+                            updated_history = chat_history + [HumanMessage(content=question), AIMessage(content=final_output)]
+                            state["history"] = updated_history[-10:]
+                            print(f"--- Resposta Final para o Usuário: {final_output} ---")
+                            return {
+                                "answer": final_output,
+                                "needs_pagination_confirmation": False,
+                                "pagination": None,
+                                "sources": None,
+                                "disambiguation": response_disambiguation,
+                            }
+                    if response_disambiguation:
+                        final_output = response_disambiguation["message"]
+                        state["disambiguation_request"] = {
+                            "type": response_disambiguation.get("type"),
+                            "question": standalone_question,
+                        }
+                        updated_history = chat_history + [HumanMessage(content=question), AIMessage(content=final_output)]
+                        state["history"] = updated_history[-10:]
+                        print(f"--- Resposta Final para o Usuário: {final_output} ---")
+                        return {
+                            "answer": final_output,
+                            "needs_pagination_confirmation": False,
+                            "pagination": None,
+                            "sources": None,
+                            "disambiguation": response_disambiguation,
+                        }
                     else:
                         print(f"--- Pergunta Independente Gerada: {standalone_question} ---")
 
@@ -1424,4 +1609,5 @@ class ClimateDataAgent:
             "needs_pagination_confirmation": needs_confirmation,
             "pagination": pagination_payload,
             "sources": response_sources or None,
+            "disambiguation": response_disambiguation or None,
         }

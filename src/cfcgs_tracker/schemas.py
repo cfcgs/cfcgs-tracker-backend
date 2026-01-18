@@ -172,6 +172,7 @@ class ChatQuery(BaseModel):
     page: int = 1
     page_size: int = 10
     confirm_pagination: bool = False
+    disambiguation_choice: Optional[Dict[str, str]] = None
 
 
 class PaginationResult(BaseModel):
@@ -187,11 +188,23 @@ class ChatSource(BaseModel):
     url: str
 
 
+class DisambiguationOption(BaseModel):
+    name: str
+    kind: str
+
+
+class DisambiguationPayload(BaseModel):
+    message: str
+    options: List[DisambiguationOption]
+    mode: str = "select"
+
+
 class ChatResponse(BaseModel):
     answer: str
     needs_pagination_confirmation: bool = False
     pagination: Optional[PaginationResult] = None
     sources: Optional[List[ChatSource]] = None
+    disambiguation: Optional[DisambiguationPayload] = None
 
 
 class KpiResponseSchema(BaseModel):
