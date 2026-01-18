@@ -23,5 +23,6 @@ def ask_chatbot(query: ChatQuery, session: T_Session):
         page=query.page,
         page_size=query.page_size,
         confirm_pagination=query.confirm_pagination,
+        disambiguation_choice=query.disambiguation_choice,
     )
     return answer_payload

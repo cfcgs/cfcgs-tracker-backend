@@ -31,7 +31,7 @@ async def lifespan(app: FastAPI):
     print("Aplicação encerrando.")
 
 
-app = FastAPI(lifespan=lifespan)
+app = FastAPI(lifespan=lifespan, root_path="/api")
 
 app.add_middleware(
     CORSMiddleware,
