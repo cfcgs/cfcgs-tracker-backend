@@ -1,4 +1,6 @@
 import math
+import threading
+import time
 from typing import Optional, List, Dict, Any
 
 from fastapi import HTTPException
@@ -32,6 +34,130 @@ from src.cfcgs_tracker.schemas import (
     KpiResponseSchema,
 )
 from src.utils.parser import safe_float, safe_int
+
+HEATMAP_CACHE_TTL_SECONDS = 300
+_HEATMAP_CACHE_LOCK = threading.Lock()
+_HEATMAP_METADATA_CACHE: Dict[tuple, Dict[str, Any]] = {}
+
+
+def invalidate_heatmap_cache() -> None:
+    with _HEATMAP_CACHE_LOCK:
+        _HEATMAP_METADATA_CACHE.clear()
+
+
+def _make_heatmap_cache_key(
+    filter_years: Optional[List[int]],
+    filter_country_ids: Optional[List[int]],
+    filter_project_ids: Optional[List[int]],
+    objective: str,
+) -> tuple:
+    def _normalize(values: Optional[List[int]]) -> Optional[tuple]:
+        if not values:
+            return None
+        return tuple(sorted(values))
+
+    return (
+        objective or "all",
+        _normalize(filter_years),
+        _normalize(filter_country_ids),
+        _normalize(filter_project_ids),
+    )
+
+
+def _get_heatmap_cached_metadata(
+    db: Session,
+    filter_years: Optional[List[int]],
+    filter_country_ids: Optional[List[int]],
+    filter_project_ids: Optional[List[int]],
+    objective: str,
+) -> Dict[str, Any]:
+    cache_key = _make_heatmap_cache_key(
+        filter_years, filter_country_ids, filter_project_ids, objective
+    )
+    now = time.time()
+    with _HEATMAP_CACHE_LOCK:
+        cached = _HEATMAP_METADATA_CACHE.get(cache_key)
+        if cached and now - cached["ts"] <= HEATMAP_CACHE_TTL_SECONDS:
+            return cached["data"]
+
+    objective_filtered_cte = _build_objective_filtered_commits_cte(
+        filter_years=filter_years,
+        filter_country_ids=filter_country_ids,
+        filter_project_ids=filter_project_ids,
+        objective=objective,
+    )
+
+    totals_query = select(
+        func.coalesce(func.sum(objective_filtered_cte.c.sum_total), 0).label(
+            "grand_total"
+        ),
+        func.coalesce(
+            func.count(objective_filtered_cte.c.project_id.distinct()), 0
+        ).label("grand_total_projects"),
+    )
+    totals = db.execute(totals_query).one()
+    grand_total = float(totals.grand_total or 0)
+    grand_total_projects = int(totals.grand_total_projects or 0)
+
+    totals_by_country_query = (
+        select(
+            objective_filtered_cte.c.country_id,
+            objective_filtered_cte.c.country_name,
+            func.sum(objective_filtered_cte.c.sum_total).label("total_amount"),
+            func.count(objective_filtered_cte.c.project_id.distinct()).label(
+                "project_count"
+            ),
+        )
+        .group_by(
+            objective_filtered_cte.c.country_id,
+            objective_filtered_cte.c.country_name,
+        )
+        .order_by(objective_filtered_cte.c.country_name)
+    )
+    totals_by_year_query = (
+        select(
+            objective_filtered_cte.c.year,
+            func.sum(objective_filtered_cte.c.sum_total).label("total_amount"),
+            func.count(objective_filtered_cte.c.project_id.distinct()).label(
+                "project_count"
+            ),
+        )
+        .group_by(objective_filtered_cte.c.year)
+        .order_by(objective_filtered_cte.c.year)
+    )
+
+    totals_by_country = []
+    for row in db.execute(totals_by_country_query).all():
+        totals_by_country.append(
+            {
+                "country_id": int(row.country_id),
+                "country_name": row.country_name,
+                "total_amount": float(row.total_amount or 0),
+                "project_count": int(row.project_count or 0),
+            }
+        )
+
+    totals_by_year = []
+    for row in db.execute(totals_by_year_query).all():
+        totals_by_year.append(
+            {
+                "year": int(row.year),
+                "total_amount": float(row.total_amount or 0),
+                "project_count": int(row.project_count or 0),
+            }
+        )
+
+    payload = {
+        "grand_total": grand_total,
+        "grand_total_projects": grand_total_projects,
+        "totals_by_country": totals_by_country,
+        "totals_by_year": totals_by_year,
+    }
+
+    with _HEATMAP_CACHE_LOCK:
+        _HEATMAP_METADATA_CACHE[cache_key] = {"ts": now, "data": payload}
+
+    return payload
 
 
 def insert_funds_from_df(db: Session, df: pd.DataFrame):
@@ -444,6 +570,7 @@ def insert_fund_project_from_df(db: Session, df: pd.DataFrame):
             existing_projects[project_name] = new_project
 
         db.commit()
+        invalidate_heatmap_cache()
 
     except Exception as e:
         db.rollback()
@@ -953,24 +1080,17 @@ def get_heatmap_data(
     """
     Retorna dados agregados por ano e pais para um heatmap.
     """
-    objective_filtered_cte = _build_objective_filtered_commits_cte(
+    metadata = _get_heatmap_cached_metadata(
+        db=db,
         filter_years=filter_years,
         filter_country_ids=filter_country_ids,
         filter_project_ids=filter_project_ids,
         objective=objective,
     )
-
-    totals_query = select(
-        func.coalesce(func.sum(objective_filtered_cte.c.sum_total), 0).label(
-            "grand_total"
-        ),
-        func.coalesce(
-            func.count(objective_filtered_cte.c.project_id.distinct()), 0
-        ).label("grand_total_projects"),
-    )
-    totals = db.execute(totals_query).one()
-    grand_total = float(totals.grand_total or 0)
-    grand_total_projects = int(totals.grand_total_projects or 0)
+    grand_total = float(metadata["grand_total"] or 0)
+    grand_total_projects = int(metadata["grand_total_projects"] or 0)
+    totals_by_country = metadata["totals_by_country"]
+    totals_by_year = metadata["totals_by_year"]
 
     if grand_total == 0:
         return {
@@ -991,76 +1111,13 @@ def get_heatmap_data(
         }
 
     if view == "country_year":
-        row_count_query = select(
-            func.count(objective_filtered_cte.c.country_id.distinct())
-        )
-        column_count_query = select(
-            func.count(objective_filtered_cte.c.year.distinct())
-        )
-        row_totals_base_query = (
-            select(
-                objective_filtered_cte.c.country_id,
-                objective_filtered_cte.c.country_name,
-                func.sum(objective_filtered_cte.c.sum_total).label("total_amount"),
-                func.count(objective_filtered_cte.c.project_id.distinct()).label(
-                    "project_count"
-                ),
-            )
-            .group_by(
-                objective_filtered_cte.c.country_id,
-                objective_filtered_cte.c.country_name,
-            )
-            .order_by(objective_filtered_cte.c.country_name)
-        )
-        column_totals_base_query = (
-            select(
-                objective_filtered_cte.c.year,
-                func.sum(objective_filtered_cte.c.sum_total).label("total_amount"),
-                func.count(objective_filtered_cte.c.project_id.distinct()).label(
-                    "project_count"
-                ),
-            )
-            .group_by(objective_filtered_cte.c.year)
-            .order_by(objective_filtered_cte.c.year)
-        )
+        row_count = len(totals_by_country)
+        column_count = len(totals_by_year)
     elif view == "year_country":
-        row_count_query = select(
-            func.count(objective_filtered_cte.c.year.distinct())
-        )
-        column_count_query = select(
-            func.count(objective_filtered_cte.c.country_id.distinct())
-        )
-        row_totals_base_query = (
-            select(
-                objective_filtered_cte.c.year,
-                func.sum(objective_filtered_cte.c.sum_total).label("total_amount"),
-                func.count(objective_filtered_cte.c.project_id.distinct()).label(
-                    "project_count"
-                ),
-            )
-            .group_by(objective_filtered_cte.c.year)
-            .order_by(objective_filtered_cte.c.year)
-        )
-        column_totals_base_query = (
-            select(
-                objective_filtered_cte.c.country_id,
-                objective_filtered_cte.c.country_name,
-                func.sum(objective_filtered_cte.c.sum_total).label("total_amount"),
-                func.count(objective_filtered_cte.c.project_id.distinct()).label(
-                    "project_count"
-                ),
-            )
-            .group_by(
-                objective_filtered_cte.c.country_id,
-                objective_filtered_cte.c.country_name,
-            )
-            .order_by(objective_filtered_cte.c.country_name)
-        )
+        row_count = len(totals_by_year)
+        column_count = len(totals_by_country)
     else:
         raise HTTPException(status_code=400, detail="Visualizacao (view) invalida.")
-
-    row_count = int(db.execute(row_count_query).scalar_one_or_none() or 0)
-    column_count = int(db.execute(column_count_query).scalar_one_or_none() or 0)
 
     if row_count == 0 or column_count == 0:
         return {
@@ -1090,22 +1147,19 @@ def get_heatmap_data(
     if column_offset >= column_count:
         column_offset = max(column_count - column_limit, 0)
 
-    row_totals_query = (
-        row_totals_base_query.limit(row_limit).offset(row_offset)
-    )
-    column_totals_query = (
-        column_totals_base_query.limit(column_limit).offset(column_offset)
-    )
-
-    row_totals_results = db.execute(row_totals_query).all()
-    column_totals_results = db.execute(column_totals_query).all()
+    if view == "country_year":
+        row_totals_results = totals_by_country[row_offset:row_offset + row_limit]
+        column_totals_results = totals_by_year[column_offset:column_offset + column_limit]
+    else:
+        row_totals_results = totals_by_year[row_offset:row_offset + row_limit]
+        column_totals_results = totals_by_country[column_offset:column_offset + column_limit]
 
     if view == "country_year":
-        row_keys = [row.country_id for row in row_totals_results]
-        column_keys = [row.year for row in column_totals_results]
+        row_keys = [row["country_id"] for row in row_totals_results]
+        column_keys = [row["year"] for row in column_totals_results]
     else:
-        row_keys = [row.year for row in row_totals_results]
-        column_keys = [row.country_id for row in column_totals_results]
+        row_keys = [row["year"] for row in row_totals_results]
+        column_keys = [row["country_id"] for row in column_totals_results]
 
     row_totals = []
     column_totals = []
@@ -1114,18 +1168,18 @@ def get_heatmap_data(
 
     for row in row_totals_results:
         if view == "country_year":
-            label = row.country_name
-            row_key = row.country_id
+            label = row["country_name"]
+            row_key = row["country_id"]
             year = None
-            country_id = row.country_id
+            country_id = row["country_id"]
         else:
-            label = str(row.year)
-            row_key = row.year
-            year = row.year
+            label = str(row["year"])
+            row_key = row["year"]
+            year = row["year"]
             country_id = None
 
-        total_amount = float(row.total_amount or 0)
-        project_count = int(row.project_count or 0)
+        total_amount = float(row["total_amount"] or 0)
+        project_count = int(row["project_count"] or 0)
         percent_of_total = (total_amount / grand_total) * 100 if grand_total else 0
 
         row_totals.append(
@@ -1142,18 +1196,18 @@ def get_heatmap_data(
 
     for row in column_totals_results:
         if view == "country_year":
-            label = str(row.year)
-            column_key = row.year
-            year = row.year
+            label = str(row["year"])
+            column_key = row["year"]
+            year = row["year"]
             country_id = None
         else:
-            label = row.country_name
-            column_key = row.country_id
+            label = row["country_name"]
+            column_key = row["country_id"]
             year = None
-            country_id = row.country_id
+            country_id = row["country_id"]
 
-        total_amount = float(row.total_amount or 0)
-        project_count = int(row.project_count or 0)
+        total_amount = float(row["total_amount"] or 0)
+        project_count = int(row["project_count"] or 0)
         percent_of_total = (total_amount / grand_total) * 100 if grand_total else 0
 
         column_totals.append(
@@ -1188,6 +1242,13 @@ def get_heatmap_data(
             "row_limit": row_limit,
             "column_limit": column_limit,
         }
+
+    objective_filtered_cte = _build_objective_filtered_commits_cte(
+        filter_years=filter_years,
+        filter_country_ids=filter_country_ids,
+        filter_project_ids=filter_project_ids,
+        objective=objective,
+    )
 
     cell_query = (
         select(
