@@ -386,6 +386,7 @@ class ClimateDataAgent:
                 "last_question": None,
                 "last_query": None,
                 "last_filters": None,
+                "confirmed_country": None,
                 "last_used_at": 0.0,
             }
         state = self.sessions[session_id]
@@ -395,6 +396,7 @@ class ClimateDataAgent:
         state.setdefault("last_question", None)
         state.setdefault("last_query", None)
         state.setdefault("last_filters", None)
+        state.setdefault("confirmed_country", None)
         state.setdefault("last_used_at", 0.0)
         return state
 
@@ -673,20 +675,21 @@ class ClimateDataAgent:
         safe_country = country.replace("'", "''")
         updated = query
 
+        string_literal = r"'(?:''|[^'])*'"
         or_pattern = re.compile(
-            r"(?:vcd\.)?country_name\s+ILIKE\s+'[^']+'\s+OR\s+(?:vcd\.)?country_name\s+ILIKE\s+'[^']+'",
+            rf"(?:vcd\.)?country_name\s+ILIKE\s+{string_literal}\s+OR\s+(?:vcd\.)?country_name\s+ILIKE\s+{string_literal}",
             re.IGNORECASE,
         )
         updated = or_pattern.sub(f"vcd.country_name ILIKE '{safe_country}'", updated)
 
         single_pattern = re.compile(
-            r"(?:vcd\.)?country_name\s+(?:ILIKE|=)\s+'[^']+'",
+            rf"(?:vcd\.)?country_name\s+(?:ILIKE|=)\s+{string_literal}",
             re.IGNORECASE,
         )
         updated = single_pattern.sub(f"vcd.country_name ILIKE '{safe_country}'", updated)
 
         countries_pattern = re.compile(
-            r"countries\.name\s+(?:ILIKE|=)\s+'[^']+'",
+            rf"countries\.name\s+(?:ILIKE|=)\s+{string_literal}",
             re.IGNORECASE,
         )
         updated = countries_pattern.sub(f"countries.name ILIKE '{safe_country}'", updated)
@@ -994,32 +997,40 @@ class ClimateDataAgent:
             "provider_name": ["provider_name"],
             "fund_name": ["fund_name", "funds.fund_name"],
         }
+        string_literal = r"'(?:''|[^'])*'"
+
+        def normalize_literal(value: str) -> str:
+            text = value.strip()
+            if text.startswith("'") and text.endswith("'") and len(text) >= 2:
+                text = text[1:-1]
+            return text.replace("''", "'")
 
         for field, variants in column_variants.items():
             matches = []
             for variant in variants:
                 escaped = re.escape(variant)
                 # Padrão para ILIKE 'Value' ou = 'Value'
-                pattern = rf"(?:\b\w+\.)?{escaped}\s*(?:ILIKE|=)\s*'([^']+)'"
+                pattern = rf"(?:\b\w+\.)?{escaped}\s*(?:ILIKE|=)\s*({string_literal})"
                 # Inclui também o padrão com OR para países
-                or_pattern = rf"(?:\b\w+\.)?{escaped}\s*(?:ILIKE|=)\s*'([^']+)'\s+OR\s+(?:\b\w+\.)?{escaped}\s*(?:ILIKE|=)\s*'([^']+)'"
+                or_pattern = rf"(?:\b\w+\.)?{escaped}\s*(?:ILIKE|=)\s*({string_literal})\s+OR\s+(?:\b\w+\.)?{escaped}\s*(?:ILIKE|=)\s*({string_literal})"
                 
                 # Extrai primeiro os ORs (captura 2 valores)
                 or_matches = re.findall(or_pattern, query, re.IGNORECASE)
                 for match in or_matches:
-                    matches.extend(match) # Adiciona ambos os valores capturados
+                    matches.extend(normalize_literal(item) for item in match) # Adiciona ambos os valores capturados
                 
                 # Extrai os simples (captura 1 valor)
                 simple_matches = re.findall(pattern, query, re.IGNORECASE)
                 # Filtra os simples que já foram capturados pelo OR para evitar duplicação
                 for simple_match in simple_matches:
+                    simple_value = normalize_literal(simple_match)
                     is_duplicate = False
                     for or_match in or_matches:
-                        if simple_match in or_match:
+                        if simple_value in [normalize_literal(item) for item in or_match]:
                             is_duplicate = True
                             break
                     if not is_duplicate:
-                        matches.append(simple_match)
+                        matches.append(simple_value)
 
             if matches:
                 # Remove duplicatas mantendo a ordem (Python 3.7+)
@@ -1082,6 +1093,9 @@ class ClimateDataAgent:
         state["last_query"] = query
         state["last_rows"] = serialized
         state["last_filters"] = filters
+        country_name = filters.get("country_name")
+        if country_name:
+            state["confirmed_country"] = country_name.split(" / ", 1)[0].strip()
 
     def _clear_context_rows(self, session_id: str):
         state = self._get_state(session_id)
@@ -1318,6 +1332,7 @@ class ClimateDataAgent:
                     disambiguation_choice,
                 )
                 confirmed_country_override = disambiguation_choice.get("name") or None
+                state["confirmed_country"] = confirmed_country_override
                 skip_geo_disambiguation = True
             state["disambiguation_request"] = None
 
@@ -1432,6 +1447,17 @@ class ClimateDataAgent:
                 routing_country = self._sanitize_country_mention(
                     routing.get("country_mention") or ""
                 )
+                last_confirmed = state.get("confirmed_country")
+                if not last_confirmed:
+                    last_filters = state.get("last_filters") or {}
+                    previous = last_filters.get("country_name")
+                    if previous:
+                        last_confirmed = previous.split(" / ", 1)[0].strip()
+                        state["confirmed_country"] = last_confirmed
+                if routing_country and last_confirmed:
+                    if self._normalize_geo_key(routing_country) == self._normalize_geo_key(last_confirmed):
+                        confirmed_country_override = last_confirmed
+                        skip_geo_disambiguation = True
                 routing_objective = routing.get("objective_only") or ""
                 routing_year_start = routing.get("year_start")
                 routing_year_end = routing.get("year_end")
