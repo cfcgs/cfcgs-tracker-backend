@@ -18,6 +18,9 @@ class Settings(BaseSettings):
     SIMILARITY_THRESHOLD: int
     REGIONS: str
     GEMINI_API_KEY: str
+    CHATBOT_RATE_LIMIT_REQUESTS: int = 30
+    CHATBOT_RATE_LIMIT_WINDOW_SECONDS: int = 60
+    CHATBOT_RATE_LIMIT_ENABLED: bool = True
 
     @property
     def expected_columns_set(self) -> Set[str]:
