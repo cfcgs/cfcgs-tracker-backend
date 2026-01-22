@@ -270,6 +270,15 @@ class HeatmapProjectsResponseSchema(BaseModel):
     has_more: bool
     projects: List[HeatmapProjectSchema]
 
+
+class HeatmapKpiResponseSchema(BaseModel):
+    total_projects: int
+    total_countries: int
+    total_amount: float
+    total_adaptation: float
+    total_mitigation: float
+    total_overlap: float
+
 class ProjectSimple(BaseModel):
     id: int
     name: str
