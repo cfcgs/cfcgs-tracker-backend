@@ -1346,6 +1346,52 @@ def get_heatmap_data(
     }
 
 
+def get_heatmap_kpis(
+    db: Session,
+    filter_years: Optional[List[int]],
+    filter_country_ids: Optional[List[int]],
+    filter_project_ids: Optional[List[int]],
+    objective: str,
+) -> Dict[str, Any]:
+    objective_filtered_cte = _build_objective_filtered_commits_cte(
+        filter_years=filter_years,
+        filter_country_ids=filter_country_ids,
+        filter_project_ids=filter_project_ids,
+        objective=objective,
+    )
+
+    totals_query = select(
+        func.coalesce(func.sum(objective_filtered_cte.c.sum_total), 0).label(
+            "total_amount"
+        ),
+        func.coalesce(func.sum(objective_filtered_cte.c.sum_ada_ex), 0).label(
+            "total_adaptation"
+        ),
+        func.coalesce(func.sum(objective_filtered_cte.c.sum_mit_ex), 0).label(
+            "total_mitigation"
+        ),
+        func.coalesce(func.sum(objective_filtered_cte.c.sum_overlap), 0).label(
+            "total_overlap"
+        ),
+        func.coalesce(
+            func.count(objective_filtered_cte.c.project_id.distinct()), 0
+        ).label("total_projects"),
+        func.coalesce(
+            func.count(objective_filtered_cte.c.country_id.distinct()), 0
+        ).label("total_countries"),
+    )
+
+    totals = db.execute(totals_query).one()
+    return {
+        "total_projects": int(totals.total_projects or 0),
+        "total_countries": int(totals.total_countries or 0),
+        "total_amount": float(totals.total_amount or 0),
+        "total_adaptation": float(totals.total_adaptation or 0),
+        "total_mitigation": float(totals.total_mitigation or 0),
+        "total_overlap": float(totals.total_overlap or 0),
+    }
+
+
 def get_heatmap_cell_projects(
     db: Session,
     year: int,

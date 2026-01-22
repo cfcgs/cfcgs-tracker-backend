@@ -138,6 +138,10 @@ Q: Qual ano teve a maior doação para mitigação?
 (CRÍTICO: Ano é um inteiro. Não use EXTRACT(YEAR FROM vcd.year))
 SQL: SELECT vcd.year, SUM(vcd.mitigation_amount_usd_thousand) AS total FROM view_commitments_detailed vcd GROUP BY vcd.year ORDER BY total DESC LIMIT 1
 
+Q: Algum país não recebeu nada para mitigação?
+(CRÍTICO: Considere apenas países com total doado > 0)
+SQL: SELECT vcd.country_name FROM view_commitments_detailed vcd GROUP BY vcd.country_name HAVING SUM(vcd.amount_usd_thousand) > 0 AND SUM(vcd.mitigation_amount_usd_thousand) = 0 LIMIT 1
+
 Q: Qual o projeto que mais financiou o Brasil em 2023?
 (Usa ILIKE para flexibilidade)
 SQL: SELECT vcd.project_name, SUM(vcd.amount_usd_thousand) AS total_amount FROM view_commitments_detailed vcd WHERE vcd.country_name ILIKE 'Brasil' AND vcd.year = 2023 GROUP BY vcd.project_name ORDER BY total_amount DESC LIMIT 1
@@ -191,6 +195,7 @@ SQL_PROMPT_TEMPLATE = """Você é um assistente SQL de elite. Dada uma pergunta,
 1.  **Contexto Inteligente:** Use o histórico APENAS para resolver referências ("esse projeto", "aquele país") e utilize a seção "Últimos Resultados" para descobrir nomes reais citados recentemente. Não invente filtros se a nova pergunta for independente.
 1.5. **Manutenção de Filtro (CRÍTICO):** Se a nova pergunta for um acompanhamento (ex: 'quanto doou?', 'qual foi o ano?') e o filtro geográfico (`country_name`, `region_name`) ou temporal (`year`) da `Última Pergunta` for relevante, você deve **manter o filtro** na nova consulta SQL.
 2.  **Lógica de Negócio (CRÍTICA):** Para encontrar o país **RECEPTOR**, **SEMPRE** use `commitments.recipient_country_id` (com JOIN) OU `vcd.country_name` (da view). **NÃO USE** `projects.country_id` para filtrar por país receptor.
+2.5. **Cobertura de Países (CRÍTICO):** Sempre considere **apenas países que receberam algum valor**. Para isso, use `vcd.amount_usd_thousand > 0` ou `commitments.amount_usd_thousand > 0` como filtro/base. Em perguntas do tipo "algum país não recebeu X", trabalhe sobre o conjunto com `SUM(amount_usd_thousand) > 0` e depois aplique a condição do objetivo (ex: mitigação = 0). **Não use a tabela `countries` isoladamente** para listas/checagens de países.
 3.  **Escolha (View vs. Tabelas):** Use a `view_commitments_detailed vcd` se a pergunta exigir múltiplos NOMES. Use as tabelas base para consultas simples. Se usar a view `vcd`, **NÃO FAÇA JOIN** com `projects` ou `countries`.
 4.  **Filtros (Linguagem) - CRÍTICO:** Os dados de nomes (países, regiões) podem estar em Português ou Inglês. Para garantir que a consulta funcione, **SEMPRE** use o operador `ILIKE` (case-insensitive). **Para nomes de países/regiões comuns (como 'África do Sul', 'África Subsaariana'), gere uma cláusula `OR` para checar a versão em Inglês (prioridade) E a versão em Português.** Ex: `WHERE (vcd.country_name ILIKE 'South Africa' OR vcd.country_name ILIKE 'África do Sul')`. Para nomes que são iguais (ex: 'Brasil', 'Nepal'), use apenas `ILIKE 'Brasil'`. **Se o nome do local tiver vírgula ou sufixo 'regional', preserve o nome literal completo (incluindo a vírgula) e, na ausência de "região" explícito na pergunta, priorize `country_name`.**
 5.  **Segurança:** NUNCA gere SQL que consulte `alembic_version`.
@@ -807,6 +812,7 @@ class ClimateDataAgent:
                 FROM view_commitments_detailed vcd
                 WHERE vcd.country_name IS NOT NULL
                   AND vcd.country_name <> ''
+                  AND vcd.amount_usd_thousand > 0
                   AND ({where_clause})
                 LIMIT 10
             """
@@ -835,6 +841,7 @@ class ClimateDataAgent:
             FROM view_commitments_detailed vcd
             WHERE vcd.country_name IS NOT NULL
               AND vcd.country_name <> ''
+              AND vcd.amount_usd_thousand > 0
         """
         try:
             result = self.db_session.execute(text(sql))
@@ -935,6 +942,30 @@ class ClimateDataAgent:
         )
         payload["mention"] = effective_mention
         return question, payload
+
+    def _infer_disambiguation_choice(
+        self,
+        question: str,
+        pending: Optional[Dict[str, object]],
+    ) -> Optional[Dict[str, str]]:
+        if not question or not pending or pending.get("type") != "geo":
+            return None
+        options = pending.get("options") or []
+        if not options:
+            return None
+        normalized_question = self._normalize_geo_key(question)
+        if not normalized_question:
+            return None
+        for option in options:
+            name = (option or {}).get("name")
+            if not name:
+                continue
+            normalized_name = self._normalize_geo_key(name)
+            if not normalized_name:
+                continue
+            if normalized_question == normalized_name or normalized_name in normalized_question:
+                return {"name": name, "kind": "country"}
+        return None
 
     def _extract_recent_entities(self, session_id: str) -> Dict[str, str]:
         state = self._get_state(session_id)
@@ -1320,10 +1351,14 @@ class ClimateDataAgent:
         skip_geo_disambiguation = False
         pending_disambiguation = state.get("disambiguation_request")
         if pending_disambiguation and not disambiguation_choice:
-            pending_question = pending_disambiguation.get("question")
-            if pending_question and pending_question != question:
-                state["disambiguation_request"] = None
-                pending_disambiguation = None
+            inferred_choice = self._infer_disambiguation_choice(question, pending_disambiguation)
+            if inferred_choice:
+                disambiguation_choice = inferred_choice
+            else:
+                pending_question = pending_disambiguation.get("question")
+                if pending_question and pending_question != question:
+                    state["disambiguation_request"] = None
+                    pending_disambiguation = None
         if disambiguation_choice and pending_disambiguation:
             if pending_disambiguation.get("type") == "geo":
                 question = self._apply_geo_choice(

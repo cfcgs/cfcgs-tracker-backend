@@ -11,13 +11,13 @@ from src.cfcgs_tracker.schemas import (
     CommitmentDataFilter,
     CommitmentList,
     Message, ObjectiveTotalsList, ObjectiveDataFilter, TimeSeriesResponse,
-    HeatmapResponseSchema, HeatmapProjectsResponseSchema, KpiResponseSchema,
+    HeatmapResponseSchema, HeatmapProjectsResponseSchema, HeatmapKpiResponseSchema, KpiResponseSchema,
 )
 from src.services.fund_service import (
     get_commitments_data,
     insert_commitments_from_df, get_totals_by_objective, get_commitment_time_series, get_distinct_commitment_years,
     stream_commitments_csv, get_heatmap_data, get_heatmap_cell_projects,
-    get_dashboard_kpis,
+    get_dashboard_kpis, get_heatmap_kpis,
 )
 from src.utils.parser import read_file
 
@@ -172,6 +172,44 @@ def get_heatmap_diagram_data(
     except Exception as e:
         raise HTTPException(
             status_code=500, detail=f"Ocorreu um erro ao buscar os dados: {str(e)}"
+        )
+
+
+@router.get(
+    "/heatmap_kpis",
+    response_model=HeatmapKpiResponseSchema,
+    status_code=HTTPStatus.OK,
+)
+def get_heatmap_kpi_data(
+    session: T_Session,
+    years: Optional[List[int]] = Query(
+        None, alias="year", description="Filtra por um ou mais anos"
+    ),
+    country_ids: Optional[List[int]] = Query(
+        None, alias="country_id", description="Filtra por um ou mais IDs de paises"
+    ),
+    project_ids: Optional[List[int]] = Query(
+        None, alias="project_id", description="Filtra por um ou mais IDs de projetos"
+    ),
+    objective: ObjectiveFilter = Query(
+        ObjectiveFilter.all,
+        description="Filtra por objetivo do financiamento (padrao: 'all')",
+    ),
+):
+    """
+    Retorna KPIs agregados para os filtros do heatmap.
+    """
+    try:
+        return get_heatmap_kpis(
+            session,
+            filter_years=years,
+            filter_country_ids=country_ids,
+            filter_project_ids=project_ids,
+            objective=objective.value,
+        )
+    except Exception as e:
+        raise HTTPException(
+            status_code=500, detail=f"Ocorreu um erro ao buscar os KPIs: {str(e)}"
         )
 
 
