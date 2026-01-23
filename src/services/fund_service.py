@@ -4,7 +4,7 @@ import time
 from typing import Optional, List, Dict, Any
 
 from fastapi import HTTPException
-from sqlalchemy import func, select, desc
+from sqlalchemy import func, select, desc, literal
 from sqlalchemy.orm import Session, joinedload
 from src.cfcgs_tracker.models import (
     Fund,
@@ -87,10 +87,14 @@ def _get_heatmap_cached_metadata(
         objective=objective,
     )
 
+    amount_col = (
+        objective_filtered_cte.c.sum_overlap
+        if objective == "both"
+        else objective_filtered_cte.c.sum_total
+    )
+
     totals_query = select(
-        func.coalesce(func.sum(objective_filtered_cte.c.sum_total), 0).label(
-            "grand_total"
-        ),
+        func.coalesce(func.sum(amount_col), 0).label("grand_total"),
         func.coalesce(
             func.count(objective_filtered_cte.c.project_id.distinct()), 0
         ).label("grand_total_projects"),
@@ -103,7 +107,7 @@ def _get_heatmap_cached_metadata(
         select(
             objective_filtered_cte.c.country_id,
             objective_filtered_cte.c.country_name,
-            func.sum(objective_filtered_cte.c.sum_total).label("total_amount"),
+            func.sum(amount_col).label("total_amount"),
             func.count(objective_filtered_cte.c.project_id.distinct()).label(
                 "project_count"
             ),
@@ -117,7 +121,7 @@ def _get_heatmap_cached_metadata(
     totals_by_year_query = (
         select(
             objective_filtered_cte.c.year,
-            func.sum(objective_filtered_cte.c.sum_total).label("total_amount"),
+            func.sum(amount_col).label("total_amount"),
             func.count(objective_filtered_cte.c.project_id.distinct()).label(
                 "project_count"
             ),
@@ -1250,6 +1254,12 @@ def get_heatmap_data(
         objective=objective,
     )
 
+    amount_col = (
+        objective_filtered_cte.c.sum_overlap
+        if objective == "both"
+        else objective_filtered_cte.c.sum_total
+    )
+
     cell_query = (
         select(
             objective_filtered_cte.c.country_id,
@@ -1262,7 +1272,7 @@ def get_heatmap_data(
                 "mitigation_exclusive"
             ),
             func.sum(objective_filtered_cte.c.sum_overlap).label("overlap"),
-            func.sum(objective_filtered_cte.c.sum_total).label("total_amount"),
+            func.sum(amount_col).label("total_amount"),
             func.count(objective_filtered_cte.c.project_id.distinct()).label(
                 "project_count"
             ),
@@ -1303,6 +1313,13 @@ def get_heatmap_data(
         total_amount = float(row.total_amount or 0)
         row_total_amount = row_total_map.get(row_key, 0) or 0
         column_total_amount = column_total_map.get(column_key, 0) or 0
+        adaptation_exclusive = float(row.adaptation_exclusive or 0)
+        mitigation_exclusive = float(row.mitigation_exclusive or 0)
+        overlap_amount = float(row.overlap or 0)
+
+        if objective == "both":
+            adaptation_exclusive = 0.0
+            mitigation_exclusive = 0.0
 
         cells.append(
             {
@@ -1312,9 +1329,9 @@ def get_heatmap_data(
                 "row_label": row_label,
                 "column_label": column_label,
                 "total_amount": total_amount,
-                "adaptation_exclusive": float(row.adaptation_exclusive or 0),
-                "mitigation_exclusive": float(row.mitigation_exclusive or 0),
-                "overlap": float(row.overlap or 0),
+                "adaptation_exclusive": adaptation_exclusive,
+                "mitigation_exclusive": mitigation_exclusive,
+                "overlap": overlap_amount,
                 "project_count": int(row.project_count or 0),
                 "percent_of_total": (total_amount / grand_total) * 100
                 if grand_total
@@ -1360,16 +1377,27 @@ def get_heatmap_kpis(
         objective=objective,
     )
 
+    amount_col = (
+        objective_filtered_cte.c.sum_overlap
+        if objective == "both"
+        else objective_filtered_cte.c.sum_total
+    )
+
+    adaptation_col = (
+        literal(0)
+        if objective == "both"
+        else objective_filtered_cte.c.sum_ada_ex
+    )
+    mitigation_col = (
+        literal(0)
+        if objective == "both"
+        else objective_filtered_cte.c.sum_mit_ex
+    )
+
     totals_query = select(
-        func.coalesce(func.sum(objective_filtered_cte.c.sum_total), 0).label(
-            "total_amount"
-        ),
-        func.coalesce(func.sum(objective_filtered_cte.c.sum_ada_ex), 0).label(
-            "total_adaptation"
-        ),
-        func.coalesce(func.sum(objective_filtered_cte.c.sum_mit_ex), 0).label(
-            "total_mitigation"
-        ),
+        func.coalesce(func.sum(amount_col), 0).label("total_amount"),
+        func.coalesce(func.sum(adaptation_col), 0).label("total_adaptation"),
+        func.coalesce(func.sum(mitigation_col), 0).label("total_mitigation"),
         func.coalesce(func.sum(objective_filtered_cte.c.sum_overlap), 0).label(
             "total_overlap"
         ),
@@ -1417,6 +1445,12 @@ def get_heatmap_cell_projects(
     if total == 0:
         return {"total": 0, "has_more": False, "projects": []}
 
+    amount_col = (
+        objective_filtered_cte.c.sum_overlap
+        if objective == "both"
+        else objective_filtered_cte.c.sum_total
+    )
+
     projects_query = (
         select(
             objective_filtered_cte.c.project_id,
@@ -1424,9 +1458,9 @@ def get_heatmap_cell_projects(
             objective_filtered_cte.c.sum_ada_ex.label("adaptation_exclusive"),
             objective_filtered_cte.c.sum_mit_ex.label("mitigation_exclusive"),
             objective_filtered_cte.c.sum_overlap.label("overlap"),
-            objective_filtered_cte.c.sum_total.label("total_amount"),
+            amount_col.label("total_amount"),
         )
-        .order_by(desc(objective_filtered_cte.c.sum_total))
+        .order_by(desc(amount_col))
         .limit(limit)
         .offset(offset)
     )
@@ -1437,6 +1471,9 @@ def get_heatmap_cell_projects(
         adaptation_exclusive = float(row.adaptation_exclusive or 0)
         mitigation_exclusive = float(row.mitigation_exclusive or 0)
         overlap = float(row.overlap or 0)
+        if objective == "both":
+            adaptation_exclusive = 0.0
+            mitigation_exclusive = 0.0
         objective_label = _classify_project_objective(
             adaptation_exclusive,
             mitigation_exclusive,
