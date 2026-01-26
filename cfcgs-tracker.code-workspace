@@ -5,6 +5,9 @@
 		},
 		{
 			"path": "../climate-funds-dashboard"
+		},
+		{
+			"path": "../TCC"
 		}
 	],
 	"settings": {}

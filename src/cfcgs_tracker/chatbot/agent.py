@@ -108,6 +108,10 @@ RESPOSTA: [DIRECT] Financiamento climático é o conjunto de recursos públicos 
 Q: Qual a diferença entre fundos bilaterais e multilaterais?
 RESPOSTA: [DIRECT] Fundos bilaterais são recursos de um país para outro; fundos multilaterais são financiados por vários países e geridos por organizações internacionais.
 
+Q: Quanto o fundo 'CLEAN TECHNOLOGY FUND' prometeu?
+(CRÍTICO: Pergunta sobre fundo. Use a tabela funds e a coluna pledge.)
+SQL: SELECT funds.pledge FROM funds WHERE funds.fund_name ILIKE 'CLEAN TECHNOLOGY FUND'
+
 Q: Algum projeto doou para o Brasil?
 (CRÍTICO: Busca binária (SIM/NÃO). Use LIMIT 1 sem agregação.)
 SQL: SELECT vcd.project_name, vcd.amount_usd_thousand FROM view_commitments_detailed vcd WHERE vcd.country_name ILIKE 'Brasil' AND vcd.amount_usd_thousand > 0 LIMIT 1
@@ -202,6 +206,7 @@ SQL_PROMPT_TEMPLATE = """Você é um assistente SQL de elite. Dada uma pergunta,
      - `adapt_ex = GREATEST(COALESCE(adaptation,0) - COALESCE(overlap,0), 0)`
      - `mit_ex = GREATEST(COALESCE(mitigation,0) - COALESCE(overlap,0), 0)`
      e aplique `SUM(adapt_ex)=0`, `SUM(mit_ex)=0` e `SUM(overlap)>0`.
+3.6. **Fundos (CRÍTICO):** Se a pergunta for sobre um **fundo** (pledge, approval, deposit, disbursement, projetos aprovados), use a tabela `funds` ou `vcd.fund_name` (se precisar cruzar com compromissos). **Não** use `projects.name` para filtrar fundos.
 4.  **Filtros (Linguagem) - CRÍTICO:** Os dados de nomes (países, regiões) podem estar em Português ou Inglês. Para garantir que a consulta funcione, **SEMPRE** use o operador `ILIKE` (case-insensitive). **Para nomes de países/regiões comuns (como 'África do Sul', 'África Subsaariana'), gere uma cláusula `OR` para checar a versão em Inglês (prioridade) E a versão em Português.** Ex: `WHERE (vcd.country_name ILIKE 'South Africa' OR vcd.country_name ILIKE 'África do Sul')`. Para nomes que são iguais (ex: 'Brasil', 'Nepal'), use apenas `ILIKE 'Brasil'`. **Se o nome do local tiver vírgula ou sufixo 'regional', preserve o nome literal completo (incluindo a vírgula) e, na ausência de "região" explícito na pergunta, priorize `country_name`.**
 5.  **Segurança:** NUNCA gere SQL que consulte `alembic_version`.
 6.  **Resposta Direta (Conceitos Gerais):** Se a pergunta for conceitual ou de conhecimento geral sobre financiamento climático (ex: "o que é financiamento climático", diferenças entre fundos bilaterais e multilaterais, mecanismos, fontes), responda diretamente em linguagem natural usando o prefixo `[DIRECT]` (sem SQL).
@@ -253,8 +258,12 @@ FINAL_PROMPT_TEMPLATE = """Você é um assistente prestativo. Dada uma pergunta,
 3.  **Resultado com Dados:** Responda à pergunta do usuário de forma direta e em linguagem natural usando os dados do "Resultado do SQL".
 4.  **LIMIT Padrão:** Se o SQL incluiu `LIMIT 10` (porque era um ranking/lista aberta que o usuário confirmou), mencione isso (ex: "Aqui estão os 10 principais resultados:", "O projeto que mais doou foi...").
 5.  **Nome Nulo:** Se o resultado incluir `project_name` nulo/None/null e houver o valor total doado, responda que o projeto que mais doou está com nome nulo e informe o valor aproximado doado.
-6.  **Não Exponha SQL:** NUNCA mostre a "Consulta SQL Executada" ou o "Resultado do SQL" bruto na sua resposta.
-7.  **Seja Conciso:** Apenas a resposta direta.
+6.  **Unidade Monetária (CRÍTICO):**
+    - Se a consulta envolver **fundos** (`funds.pledge`, `funds.deposit`, `funds.approval`, `funds.disbursement`), informe os valores em **USD** e deixe claro a unidade. Para valores monetários de fundos, use **milhões de USD (USD mi)**.
+    - Se a consulta envolver `funds.projects_approved`, trate como **contagem de projetos**, sem unidade monetária.
+    - Se a consulta envolver colunas `*_usd_thousand` ou `amount_usd_thousand`, informe em **milhares de USD**.
+7.  **Não Exponha SQL:** NUNCA mostre a "Consulta SQL Executada" ou o "Resultado do SQL" bruto na sua resposta.
+8.  **Seja Conciso:** Apenas a resposta direta.
 
 Resposta Final (em linguagem natural):"""
 
@@ -269,6 +278,7 @@ Retorne APENAS um JSON com:
 - response: texto curto em português (somente para intent greeting/ask_clarify)
 - country_mention: string com o país citado pelo usuário (ou "" se não houver)
 - project_mention: string com o projeto citado pelo usuário (ou "" se não houver)
+- fund_mention: string com o fundo citado pelo usuário (ou "" se não houver)
 - objective_only: uma das opções ["mitigation","adaptation","both",""] (usar apenas se o usuário pedir "somente/apenas/só")
 - year_start: número (ou null)
 - year_end: número (ou null)
@@ -289,6 +299,9 @@ Regras:
 13) Sempre que houver projeto mencionado, preencha project_mention com o nome literal como o usuário escreveu.
 14) Se a pergunta depender de um projeto do contexto recente (follow-up), use esse projeto em project_mention.
 15) project_mention deve conter apenas o nome do projeto (sem prefixos como "projeto").
+16) Sempre que houver fundo mencionado (ou termos como pledge/aprovação/deposito/desembolso/tipos de fundo), preencha fund_mention com o nome literal como o usuário escreveu.
+17) Se a pergunta depender de um fundo do contexto recente (follow-up), use esse fundo em fund_mention.
+18) fund_mention deve conter apenas o nome do fundo (sem prefixos como "fundo").
 
 Não gere SQL e não inclua explicações fora do JSON.
 
@@ -402,6 +415,7 @@ class ClimateDataAgent:
                 "last_filters": None,
                 "confirmed_country": None,
                 "confirmed_project": None,
+                "confirmed_fund": None,
                 "last_used_at": 0.0,
             }
         state = self.sessions[session_id]
@@ -413,6 +427,7 @@ class ClimateDataAgent:
         state.setdefault("last_filters", None)
         state.setdefault("confirmed_country", None)
         state.setdefault("confirmed_project", None)
+        state.setdefault("confirmed_fund", None)
         state.setdefault("last_used_at", 0.0)
         return state
 
@@ -514,6 +529,7 @@ class ClimateDataAgent:
                 "response": "",
                 "country_mention": "",
                 "project_mention": "",
+                "fund_mention": "",
                 "objective_only": "",
                 "year_start": None,
                 "year_end": None,
@@ -531,6 +547,7 @@ class ClimateDataAgent:
                 "response": "",
                 "country_mention": "",
                 "project_mention": "",
+                "fund_mention": "",
                 "objective_only": "",
                 "year_start": None,
                 "year_end": None,
@@ -542,6 +559,7 @@ class ClimateDataAgent:
         response = data.get("response") or ""
         country_mention = (data.get("country_mention") or "").strip()
         project_mention = (data.get("project_mention") or "").strip()
+        fund_mention = (data.get("fund_mention") or "").strip()
         objective_only = data.get("objective_only") or ""
         if objective_only not in allowed_objectives:
             objective_only = ""
@@ -563,6 +581,7 @@ class ClimateDataAgent:
             "response": response,
             "country_mention": country_mention,
             "project_mention": project_mention,
+            "fund_mention": fund_mention,
             "objective_only": objective_only,
             "year_start": year_start,
             "year_end": year_end,
@@ -689,6 +708,19 @@ class ClimateDataAgent:
             parts = parts[1:]
         return " ".join(parts).strip()
 
+    def _sanitize_fund_mention(self, mention: str) -> str:
+        if not mention:
+            return ""
+        cleaned = mention.strip().strip(" ?!.")
+        if not cleaned:
+            return ""
+        parts = cleaned.split()
+        if parts and parts[0].lower() in ARTICLE_PREFIXES:
+            parts = parts[1:]
+        if parts and parts[0].lower() in {"fundo", "fundos", "fund", "funds"}:
+            parts = parts[1:]
+        return " ".join(parts).strip()
+
     def _apply_geo_sql_override(self, query: str) -> str:
         if not query:
             return query
@@ -753,6 +785,73 @@ class ClimateDataAgent:
             re.IGNORECASE,
         )
         updated = projects_pattern.sub(f"projects.name ILIKE '{safe_project}'", updated)
+
+        return updated
+
+    def _apply_confirmed_fund_override(self, query: str, fund: Optional[str]) -> str:
+        if not query or not fund:
+            return query
+        safe_fund = fund.replace("'", "''")
+        updated = query
+        string_literal = r"'(?:''|[^'])*'"
+
+        def detect_fund_alias(sql: str) -> str:
+            reserved = {
+                "where",
+                "join",
+                "inner",
+                "left",
+                "right",
+                "full",
+                "group",
+                "order",
+                "limit",
+                "offset",
+                "on",
+                "union",
+                "having",
+                "select",
+                "from",
+            }
+            alias_match = re.search(
+                r"\bFROM\s+funds(?:\s+AS)?\s+(\w+)\b",
+                sql,
+                re.IGNORECASE,
+            )
+            if not alias_match:
+                alias_match = re.search(
+                    r"\bJOIN\s+funds(?:\s+AS)?\s+(\w+)\b",
+                    sql,
+                    re.IGNORECASE,
+                )
+            if alias_match:
+                candidate = alias_match.group(1)
+                if candidate.lower() not in reserved:
+                    return candidate
+            if re.search(r"\bfunds\b", sql, re.IGNORECASE):
+                return "funds"
+            if re.search(r"\bview_commitments_detailed\b", sql, re.IGNORECASE):
+                return "vcd"
+            return "funds"
+
+        fund_alias = detect_fund_alias(updated)
+
+        prefix_pattern = r"(?:\b\w+\.)*fund_name"
+        condition_pattern = re.compile(
+            rf"{prefix_pattern}\s+(?:ILIKE|=)\s+{string_literal}",
+            re.IGNORECASE,
+        )
+        updated = condition_pattern.sub(
+            f"{fund_alias}.fund_name ILIKE '{safe_fund}'", updated
+        )
+
+        projects_pattern = re.compile(
+            rf"\bprojects\.name\s+(?:ILIKE|=)\s+{string_literal}",
+            re.IGNORECASE,
+        )
+        updated = projects_pattern.sub(
+            f"{fund_alias}.fund_name ILIKE '{safe_fund}'", updated
+        )
 
         return updated
 
@@ -959,6 +1058,76 @@ class ClimateDataAgent:
             return matches
         return self._fuzzy_lookup_project_candidates(cleaned)
 
+    def _lookup_fund_candidates(self, term: str) -> List[Dict[str, str]]:
+        if not term:
+            return []
+        cleaned = self._sanitize_fund_mention(term)
+        if not cleaned:
+            return []
+        variants = [cleaned]
+        accentless = self._strip_accents(cleaned)
+        if accentless and accentless.lower() != cleaned.lower():
+            variants.append(accentless)
+
+        def run_lookup(wildcard: bool) -> List[Dict[str, str]]:
+            params = {}
+            clauses = []
+            for idx, variant in enumerate(variants):
+                param_key = f"f{idx}"
+                params[param_key] = f"%{variant}%" if wildcard else variant
+                clauses.append(f"funds.fund_name ILIKE :{param_key}")
+            where_clause = " OR ".join(clauses)
+            sql = f"""
+                SELECT DISTINCT 'fund' AS kind, funds.fund_name AS name
+                FROM funds
+                WHERE funds.fund_name IS NOT NULL
+                  AND funds.fund_name <> ''
+                  AND ({where_clause})
+                LIMIT 10
+            """
+            try:
+                result = self.db_session.execute(text(sql), params)
+                return [{"kind": row[0], "name": row[1]} for row in result.fetchall()]
+            except Exception as exc:
+                print(f"--- Falha ao buscar nomes de fundos: {exc} ---")
+                self.db_session.rollback()
+                return []
+
+        matches = run_lookup(False)
+        if matches:
+            return matches
+        matches = run_lookup(True)
+        if matches:
+            return matches
+        return self._fuzzy_lookup_fund_candidates(cleaned)
+
+    def _fuzzy_lookup_fund_candidates(self, term: str) -> List[Dict[str, str]]:
+        normalized_term = self._normalize_geo_key(term)
+        if not normalized_term:
+            return []
+        sql = """
+            SELECT DISTINCT 'fund' AS kind, funds.fund_name AS name
+            FROM funds
+            WHERE funds.fund_name IS NOT NULL
+              AND funds.fund_name <> ''
+        """
+        try:
+            result = self.db_session.execute(text(sql))
+            candidates = []
+            for kind, name in result.fetchall():
+                normalized_name = self._normalize_geo_key(name)
+                if not normalized_name:
+                    continue
+                score = SequenceMatcher(None, normalized_term, normalized_name).ratio()
+                if score >= 0.6:
+                    candidates.append({"kind": kind, "name": name, "score": score})
+            candidates.sort(key=lambda item: item["score"], reverse=True)
+            return [{"kind": item["kind"], "name": item["name"]} for item in candidates[:5]]
+        except Exception as exc:
+            print(f"--- Falha ao buscar nomes de fundos (fuzzy): {exc} ---")
+            self.db_session.rollback()
+            return []
+
     def _fuzzy_lookup_project_candidates(self, term: str) -> List[Dict[str, str]]:
         normalized_term = self._normalize_geo_key(term)
         if not normalized_term:
@@ -1035,6 +1204,30 @@ class ClimateDataAgent:
             "mode": mode,
         }
 
+    def _build_fund_disambiguation_payload(
+        self,
+        mention: str,
+        matches: List[Dict[str, str]],
+        mode: str,
+    ) -> Dict[str, object]:
+        options = [{"name": item["name"], "kind": "fund"} for item in matches]
+        options_text = ", ".join(item["name"] for item in matches)
+        if mode == "confirm":
+            message = (
+                f"Encontrei um nome de fundo semelhante a '{mention}': {options_text}. "
+                "Você quer usar essa opção?"
+            )
+        else:
+            message = (
+                f"Encontrei opções de nomes de fundos semelhantes a '{mention}': {options_text}. "
+                "Selecione a opção correta."
+            )
+        return {
+            "message": message,
+            "options": options,
+            "mode": mode,
+        }
+
     def _apply_geo_choice(
         self,
         question: str,
@@ -1071,6 +1264,28 @@ class ClimateDataAgent:
         escaped = canonical.replace("'", "''")
         quoted = f"'{escaped}'"
         replacement = f"projeto {quoted}"
+        article_pattern = re.compile(
+            rf"\b(?:o|os|a|as|ao|aos|à|às)\s+{re.escape(mention)}",
+            re.IGNORECASE,
+        )
+        if article_pattern.search(question):
+            return article_pattern.sub(replacement, question, count=1)
+        return self._replace_case_insensitive(question, mention, replacement)
+
+    def _apply_fund_choice(
+        self,
+        question: str,
+        mention: str,
+        choice: Dict[str, str],
+    ) -> str:
+        if not question or not mention or not choice:
+            return question
+        canonical = choice.get("name")
+        if not canonical:
+            return question
+        escaped = canonical.replace("'", "''")
+        quoted = f"'{escaped}'"
+        replacement = f"fundo {quoted}"
         article_pattern = re.compile(
             rf"\b(?:o|os|a|as|ao|aos|à|às)\s+{re.escape(mention)}",
             re.IGNORECASE,
@@ -1153,6 +1368,43 @@ class ClimateDataAgent:
         payload["mention"] = effective_mention
         return question, payload
 
+    def _apply_fund_disambiguation(
+        self,
+        question: str,
+        mention: Optional[str],
+    ) -> tuple[str, Optional[Dict[str, object]]]:
+        mention = self._sanitize_fund_mention(mention or "")
+        if not mention:
+            return question, None
+
+        def find_candidates(raw_mention: str) -> tuple[str, List[Dict[str, str]]]:
+            matches = self._lookup_fund_candidates(raw_mention)
+            if matches:
+                return raw_mention, matches
+            parts = raw_mention.split()
+            while len(parts) > 1:
+                parts = parts[:-1]
+                candidate = " ".join(parts).strip()
+                if not candidate:
+                    break
+                matches = self._lookup_fund_candidates(candidate)
+                if matches:
+                    return candidate, matches
+            return raw_mention, []
+
+        effective_mention, matches = find_candidates(mention)
+        if not matches:
+            return question, None
+
+        mode = "confirm" if len(matches) == 1 else "select"
+        payload = self._build_fund_disambiguation_payload(
+            mention=effective_mention,
+            matches=matches,
+            mode=mode,
+        )
+        payload["mention"] = effective_mention
+        return question, payload
+
     def _infer_disambiguation_choice(
         self,
         question: str,
@@ -1161,7 +1413,7 @@ class ClimateDataAgent:
         if not question or not pending:
             return None
         pending_type = pending.get("type")
-        if pending_type not in {"geo", "project"}:
+        if pending_type not in {"geo", "project", "fund"}:
             return None
         options = pending.get("options") or []
         if not options:
@@ -1343,6 +1595,9 @@ class ClimateDataAgent:
         project_name = filters.get("project_name")
         if project_name:
             state["confirmed_project"] = project_name.split(" / ", 1)[0].strip()
+        fund_name = filters.get("fund_name")
+        if fund_name:
+            state["confirmed_fund"] = fund_name.split(" / ", 1)[0].strip()
 
     def _clear_context_rows(self, session_id: str):
         state = self._get_state(session_id)
@@ -1565,8 +1820,10 @@ class ClimateDataAgent:
 
         confirmed_country_override: Optional[str] = None
         confirmed_project_override: Optional[str] = None
+        confirmed_fund_override: Optional[str] = None
         skip_geo_disambiguation = False
         skip_project_disambiguation = False
+        skip_fund_disambiguation = False
         pending_disambiguation = state.get("disambiguation_request")
         if pending_disambiguation and not disambiguation_choice:
             inferred_choice = self._infer_disambiguation_choice(question, pending_disambiguation)
@@ -1596,6 +1853,15 @@ class ClimateDataAgent:
                 confirmed_project_override = disambiguation_choice.get("name") or None
                 state["confirmed_project"] = confirmed_project_override
                 skip_project_disambiguation = True
+            elif pending_disambiguation.get("type") == "fund":
+                question = self._apply_fund_choice(
+                    pending_disambiguation.get("question", question),
+                    pending_disambiguation.get("mention", ""),
+                    disambiguation_choice,
+                )
+                confirmed_fund_override = disambiguation_choice.get("name") or None
+                state["confirmed_fund"] = confirmed_fund_override
+                skip_fund_disambiguation = True
             state["disambiguation_request"] = None
 
         pending = state.get("pagination_request")
@@ -1660,6 +1926,9 @@ class ClimateDataAgent:
                     limited_query = self._apply_confirmed_project_override(
                         limited_query, confirmed_project_override
                     )
+                    limited_query = self._apply_confirmed_fund_override(
+                        limited_query, confirmed_fund_override
+                    )
                     limited_query = self._apply_heatmap_count_filter(limited_query)
                     columns, rows = self.run_query(limited_query)
                     response_sources = self._detect_sources_from_query(limited_query)
@@ -1715,6 +1984,9 @@ class ClimateDataAgent:
                 routing_project = self._sanitize_project_mention(
                     routing.get("project_mention") or ""
                 )
+                routing_fund = self._sanitize_fund_mention(
+                    routing.get("fund_mention") or ""
+                )
                 last_confirmed = state.get("confirmed_country")
                 if not last_confirmed:
                     last_filters = state.get("last_filters") or {}
@@ -1737,6 +2009,17 @@ class ClimateDataAgent:
                     if self._normalize_geo_key(routing_project) == self._normalize_geo_key(last_project):
                         confirmed_project_override = last_project
                         skip_project_disambiguation = True
+                last_fund = state.get("confirmed_fund")
+                if not last_fund:
+                    last_filters = state.get("last_filters") or {}
+                    previous_fund = last_filters.get("fund_name")
+                    if previous_fund:
+                        last_fund = previous_fund.split(" / ", 1)[0].strip()
+                        state["confirmed_fund"] = last_fund
+                if routing_fund and last_fund:
+                    if self._normalize_geo_key(routing_fund) == self._normalize_geo_key(last_fund):
+                        confirmed_fund_override = last_fund
+                        skip_fund_disambiguation = True
                 routing_objective = routing.get("objective_only") or ""
                 routing_year_start = routing.get("year_start")
                 routing_year_end = routing.get("year_end")
@@ -1790,6 +2073,32 @@ class ClimateDataAgent:
                         standalone_question, session_id
                     )
                     disambiguation_response = None
+                    if not skip_fund_disambiguation:
+                        standalone_question, disambiguation_response = self._apply_fund_disambiguation(
+                            standalone_question,
+                            mention=routing_fund,
+                        )
+                        if disambiguation_response:
+                            response_disambiguation = disambiguation_response
+                            response_disambiguation["type"] = "fund"
+                            response_disambiguation["question"] = standalone_question
+                            response_disambiguation["mention"] = disambiguation_response.get("mention")
+                            final_output = disambiguation_response["message"]
+                            state["disambiguation_request"] = {
+                                "type": "fund",
+                                "question": standalone_question,
+                                "mention": disambiguation_response.get("mention", ""),
+                            }
+                            updated_history = chat_history + [HumanMessage(content=question), AIMessage(content=final_output)]
+                            state["history"] = updated_history[-10:]
+                            print(f"--- Resposta Final para o Usuário: {final_output} ---")
+                            return {
+                                "answer": final_output,
+                                "needs_pagination_confirmation": False,
+                                "pagination": None,
+                                "sources": None,
+                                "disambiguation": response_disambiguation,
+                            }
                     if not skip_project_disambiguation:
                         standalone_question, disambiguation_response = self._apply_project_disambiguation(
                             standalone_question,
@@ -1910,6 +2219,9 @@ class ClimateDataAgent:
                                 )
                                 query = self._apply_confirmed_project_override(
                                     query, confirmed_project_override
+                                )
+                                query = self._apply_confirmed_fund_override(
+                                    query, confirmed_fund_override
                                 )
                                 query = self._apply_heatmap_count_filter(query)
                                 total_rows = self._count_rows(query)
