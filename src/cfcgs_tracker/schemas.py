@@ -283,6 +283,10 @@ class ProjectSimple(BaseModel):
     id: int
     name: str
 
+class CountrySimple(BaseModel):
+    id: int
+    name: str
+
 class ProjectListResponse(BaseModel):
     projects: List[ProjectSimple]
 
@@ -290,3 +294,9 @@ class PaginatedProjectResponse(BaseModel):
     projects: List[ProjectSimple]
     total: int
     has_more: bool
+
+class HeatmapFilterOptionsSchema(BaseModel):
+    years: List[int]
+    countries: List[CountrySimple]
+    projects: List[ProjectSimple]
+    objectives: List[str]
