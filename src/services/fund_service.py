@@ -1517,7 +1517,10 @@ async def get_paginated_commitment_projects(
     db: Session,
     search: Optional[str] = None,
     limit: int = 20,
-    offset: int = 0
+    offset: int = 0,
+    filter_years: Optional[List[int]] = None,
+    filter_country_ids: Optional[List[int]] = None,
+    objective: str = "all",
 ) -> Dict[str, Any]:
     """
     Busca projetos (que têm compromissos) de forma paginada,
@@ -1530,6 +1533,18 @@ async def get_paginated_commitment_projects(
         .join(Commitment, Project.id == Commitment.project_id)
         .distinct()
     )
+
+    if filter_years:
+        base_query = base_query.filter(Commitment.year.in_(filter_years))
+    if filter_country_ids:
+        base_query = base_query.filter(Commitment.recipient_country_id.in_(filter_country_ids))
+
+    if objective == "adaptation":
+        base_query = base_query.filter(Commitment.adaptation_amount_usd_thousand > 0)
+    elif objective == "mitigation":
+        base_query = base_query.filter(Commitment.mitigation_amount_usd_thousand > 0)
+    elif objective in ("both", "overlap", "sobreposicao"):
+        base_query = base_query.filter(Commitment.overlap_amount_usd_thousand > 0)
 
     if search:
         # Adiciona filtro (case-insensitive)
@@ -1551,4 +1566,113 @@ async def get_paginated_commitment_projects(
         "limit": limit,
         "offset": offset,
         "has_more": (offset + len(projects)) < total
+    }
+
+def get_heatmap_filter_options(
+    db: Session,
+    filter_years: Optional[List[int]] = None,
+    filter_country_ids: Optional[List[int]] = None,
+    filter_project_ids: Optional[List[int]] = None,
+    objective: str = "all",
+) -> Dict[str, Any]:
+    def build_cte(
+        years: Optional[List[int]],
+        country_ids: Optional[List[int]],
+        project_ids: Optional[List[int]],
+        objective_filter: str,
+    ):
+        return _build_objective_filtered_commits_cte(
+            filter_years=years,
+            filter_country_ids=country_ids,
+            filter_project_ids=project_ids,
+            objective=objective_filter,
+        )
+
+    def amount_column(cte, objective_filter: str):
+        if objective_filter in ("both", "overlap", "sobreposicao"):
+            return cte.c.sum_overlap
+        return cte.c.sum_total
+
+    # Para cada dimensão, aplica todos os filtros EXCETO o próprio
+    years_cte = build_cte(
+        years=None,
+        country_ids=filter_country_ids,
+        project_ids=filter_project_ids,
+        objective_filter=objective,
+    )
+    years_query = (
+        select(years_cte.c.year)
+        .where(amount_column(years_cte, objective) > 0)
+        .distinct()
+        .order_by(years_cte.c.year)
+    )
+    years = [row.year for row in db.execute(years_query).all()]
+
+    countries_cte = build_cte(
+        years=filter_years,
+        country_ids=None,
+        project_ids=filter_project_ids,
+        objective_filter=objective,
+    )
+    countries_query = (
+        select(countries_cte.c.country_id, countries_cte.c.country_name)
+        .where(amount_column(countries_cte, objective) > 0)
+        .distinct()
+        .order_by(countries_cte.c.country_name)
+    )
+    countries = [{"id": row.country_id, "name": row.country_name} for row in db.execute(countries_query).all()]
+
+    projects_cte = build_cte(
+        years=filter_years,
+        country_ids=filter_country_ids,
+        project_ids=None,
+        objective_filter=objective,
+    )
+    projects_query = (
+        select(projects_cte.c.project_id, projects_cte.c.project_name)
+        .where(amount_column(projects_cte, objective) > 0)
+        .distinct()
+        .order_by(projects_cte.c.project_name)
+    )
+    projects = [{"id": row.project_id, "name": row.project_name} for row in db.execute(projects_query).all()]
+
+    objective_cte = build_cte(
+        years=filter_years,
+        country_ids=filter_country_ids,
+        project_ids=filter_project_ids,
+        objective_filter="all",
+    )
+
+    objectives = []
+    if db.execute(
+        select(func.count())
+        .select_from(objective_cte)
+        .where(objective_cte.c.sum_ada_ex > 0)
+        .where(objective_cte.c.sum_mit_ex == 0)
+        .where(objective_cte.c.sum_overlap == 0)
+    ).scalar_one():
+        objectives.append("adaptation")
+    if db.execute(
+        select(func.count())
+        .select_from(objective_cte)
+        .where(objective_cte.c.sum_mit_ex > 0)
+        .where(objective_cte.c.sum_ada_ex == 0)
+        .where(objective_cte.c.sum_overlap == 0)
+    ).scalar_one():
+        objectives.append("mitigation")
+    if db.execute(
+        select(func.count())
+        .select_from(objective_cte)
+        .where(objective_cte.c.sum_overlap > 0)
+    ).scalar_one():
+        objectives.append("both")
+
+    if "all" not in objectives:
+        objectives = ["all"] + objectives
+
+    return {
+        "years": years,
+        "countries": countries,
+        "projects": projects,
+        "objectives": objectives,
     }
