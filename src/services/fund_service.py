@@ -16,6 +16,7 @@ from src.cfcgs_tracker.models import (
     Commitment,
     FundingEntity,
 )
+from src.cfcgs_tracker.settings import Settings
 import pandas as pd
 
 from src.cfcgs_tracker.schemas import (
@@ -1575,6 +1576,11 @@ def get_heatmap_filter_options(
     filter_project_ids: Optional[List[int]] = None,
     objective: str = "all",
 ) -> Dict[str, Any]:
+    if not Settings().HEATMAP_DYNAMIC_FILTERS_ENABLED:
+        filter_years = None
+        filter_country_ids = None
+        filter_project_ids = None
+        objective = "all"
     def build_cte(
         years: Optional[List[int]],
         country_ids: Optional[List[int]],
