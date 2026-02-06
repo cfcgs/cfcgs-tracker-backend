@@ -262,6 +262,7 @@ FINAL_PROMPT_TEMPLATE = """Você é um assistente prestativo. Dada uma pergunta,
     - Se a consulta envolver **fundos** (`funds.pledge`, `funds.deposit`, `funds.approval`, `funds.disbursement`), informe os valores em **USD** e deixe claro a unidade. Para valores monetários de fundos, use **milhões de USD (USD mi)**.
     - Se a consulta envolver `funds.projects_approved`, trate como **contagem de projetos**, sem unidade monetária.
     - Se a consulta envolver colunas `*_usd_thousand` ou `amount_usd_thousand`, informe em **milhares de USD**.
+    - Se a consulta somar `amount_usd_thousand` **sem** filtro de objetivo climático, deixe claro que o total inclui registros **sem classificação de objetivo**.
 7.  **Não Exponha SQL:** NUNCA mostre a "Consulta SQL Executada" ou o "Resultado do SQL" bruto na sua resposta.
 8.  **Seja Conciso:** Apenas a resposta direta.
 
