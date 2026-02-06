@@ -986,15 +986,12 @@ def _build_objective_filtered_commits_cte(
     col_ada_raw = func.coalesce(Commitment.adaptation_amount_usd_thousand, 0)
     col_mit_raw = func.coalesce(Commitment.mitigation_amount_usd_thousand, 0)
     col_over_raw = func.coalesce(Commitment.overlap_amount_usd_thousand, 0)
-    col_amount_raw = func.coalesce(Commitment.amount_usd_thousand, 0)
 
     col_ada_ex_raw = (col_ada_raw - col_over_raw).label("adaptation_exclusive")
     col_mit_ex_raw = (col_mit_raw - col_over_raw).label("mitigation_exclusive")
-    col_total_raw = (
-        col_amount_raw
-        if objective == "all"
-        else (col_ada_ex_raw + col_mit_ex_raw + col_over_raw)
-    ).label("total_amount")
+    col_total_raw = (col_ada_ex_raw + col_mit_ex_raw + col_over_raw).label(
+        "total_amount"
+    )
 
     base_commits_query = (
         select(
@@ -1374,49 +1371,6 @@ def get_heatmap_kpis(
     filter_project_ids: Optional[List[int]],
     objective: str,
 ) -> Dict[str, Any]:
-    if objective == "all":
-        totals_query = select(
-            func.coalesce(func.sum(Commitment.amount_usd_thousand), 0).label(
-                "total_amount"
-            ),
-            func.coalesce(
-                func.sum(Commitment.adaptation_amount_usd_thousand), 0
-            ).label("total_adaptation"),
-            func.coalesce(
-                func.sum(Commitment.mitigation_amount_usd_thousand), 0
-            ).label("total_mitigation"),
-            func.coalesce(
-                func.sum(Commitment.overlap_amount_usd_thousand), 0
-            ).label("total_overlap"),
-            func.coalesce(
-                func.count(Commitment.project_id.distinct()), 0
-            ).label("total_projects"),
-            func.coalesce(
-                func.count(Commitment.recipient_country_id.distinct()), 0
-            ).label("total_countries"),
-        )
-
-        if filter_years:
-            totals_query = totals_query.filter(Commitment.year.in_(filter_years))
-        if filter_project_ids:
-            totals_query = totals_query.filter(
-                Commitment.project_id.in_(filter_project_ids)
-            )
-        if filter_country_ids:
-            totals_query = totals_query.filter(
-                Commitment.recipient_country_id.in_(filter_country_ids)
-            )
-
-        totals = db.execute(totals_query).one()
-        return {
-            "total_projects": int(totals.total_projects or 0),
-            "total_countries": int(totals.total_countries or 0),
-            "total_amount": float(totals.total_amount or 0),
-            "total_adaptation": float(totals.total_adaptation or 0),
-            "total_mitigation": float(totals.total_mitigation or 0),
-            "total_overlap": float(totals.total_overlap or 0),
-        }
-
     objective_filtered_cte = _build_objective_filtered_commits_cte(
         filter_years=filter_years,
         filter_country_ids=filter_country_ids,
