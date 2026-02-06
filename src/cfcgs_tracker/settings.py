@@ -21,6 +21,7 @@ class Settings(BaseSettings):
     CHATBOT_RATE_LIMIT_REQUESTS: int = 30
     CHATBOT_RATE_LIMIT_WINDOW_SECONDS: int = 60
     CHATBOT_RATE_LIMIT_ENABLED: bool = True
+    HEATMAP_DYNAMIC_FILTERS_ENABLED: bool = False
 
     @property
     def expected_columns_set(self) -> Set[str]:
