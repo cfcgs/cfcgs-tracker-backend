@@ -1,12 +1,14 @@
 services:
   cfcgs_tracker_database:
-    image: postgres
+    image: postgres:16
     volumes:
       - pgdata:/var/lib/postgresql/data
     environment:
       POSTGRES_USER: ${DB_USER}
       POSTGRES_DB: ${DB_NAME}
       POSTGRES_PASSWORD: ${DB_PASSWORD}
+      TZ: America/Belem
+      PGTZ: America/Belem
     ports:
       - "5432:5432"
 
@@ -19,7 +21,10 @@ services:
     depends_on:
       - cfcgs_tracker_database
     environment:
-      DATABASE_URL: ${DATABASE_URL}
+      DATABASE_URL: postgresql+psycopg://${DB_USER}:${DB_PASSWORD}@cfcgs_tracker_database:5432/${DB_NAME}
+      INITIAL_ADMIN_USERNAME: ${INITIAL_ADMIN_USERNAME}
+      INITIAL_ADMIN_EMAIL: ${INITIAL_ADMIN_EMAIL}
+      INITIAL_ADMIN_PASSWORD: ${INITIAL_ADMIN_PASSWORD}
 
 volumes:
   pgdata:

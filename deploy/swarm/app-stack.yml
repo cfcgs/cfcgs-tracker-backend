@@ -1,0 +1,99 @@
+version: "3.9"
+
+networks:
+  traefik-public:
+    external: true
+  app-internal:
+    driver: overlay
+
+volumes:
+  postgres-data:
+
+services:
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: ${DB_USER}
+      POSTGRES_PASSWORD: ${DB_PASSWORD}
+      POSTGRES_DB: ${DB_NAME}
+      TZ: America/Belem
+      PGTZ: America/Belem
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    networks:
+      - app-internal
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${DB_USER} -d ${DB_NAME}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+    deploy:
+      placement:
+        constraints:
+          - node.role == manager
+
+  backend:
+    image: ${BACKEND_IMAGE}
+    environment:
+      DATABASE_URL: postgresql+psycopg://${DB_USER}:${DB_PASSWORD}@postgres:5432/${DB_NAME}
+      EXPECTED_COLUMNS: ${EXPECTED_COLUMNS}
+      SIMILARITY_THRESHOLD: ${SIMILARITY_THRESHOLD}
+      REGIONS: ${REGIONS}
+      GEMINI_API_KEY: ${GEMINI_API_KEY}
+      SECRET_KEY: ${SECRET_KEY}
+      ALGORITHM: ${ALGORITHM}
+      ACCESS_TOKEN_EXPIRE_MINUTES: ${ACCESS_TOKEN_EXPIRE_MINUTES}
+      REFRESH_TOKEN_EXPIRE_DAYS: ${REFRESH_TOKEN_EXPIRE_DAYS}
+      INITIAL_ADMIN_USERNAME: ${INITIAL_ADMIN_USERNAME}
+      INITIAL_ADMIN_EMAIL: ${INITIAL_ADMIN_EMAIL}
+      INITIAL_ADMIN_PASSWORD: ${INITIAL_ADMIN_PASSWORD}
+      CHATBOT_RATE_LIMIT_REQUESTS: ${CHATBOT_RATE_LIMIT_REQUESTS}
+      CHATBOT_RATE_LIMIT_WINDOW_SECONDS: ${CHATBOT_RATE_LIMIT_WINDOW_SECONDS}
+      CHATBOT_RATE_LIMIT_ENABLED: ${CHATBOT_RATE_LIMIT_ENABLED}
+      HEATMAP_DYNAMIC_FILTERS_ENABLED: ${HEATMAP_DYNAMIC_FILTERS_ENABLED}
+      TZ: America/Belem
+    networks:
+      - app-internal
+      - traefik-public
+    deploy:
+      replicas: 1
+      update_config:
+        order: start-first
+        failure_action: rollback
+        parallelism: 1
+      rollback_config:
+        order: stop-first
+        parallelism: 1
+      labels:
+        - traefik.enable=true
+        - traefik.swarm.network=traefik-public
+        - traefik.http.routers.cfcgs-backend.rule=Host(`${DOMAIN}`) && PathPrefix(`/api`)
+        - traefik.http.routers.cfcgs-backend.entrypoints=websecure
+        - traefik.http.routers.cfcgs-backend.tls=true
+        - traefik.http.routers.cfcgs-backend.tls.certresolver=letsencrypt
+        - traefik.http.routers.cfcgs-backend.middlewares=cfcgs-backend-strip
+        - traefik.http.middlewares.cfcgs-backend-strip.stripprefix.prefixes=/api
+        - traefik.http.services.cfcgs-backend.loadbalancer.server.port=8000
+
+  frontend:
+    image: ${FRONTEND_IMAGE}
+    networks:
+      - traefik-public
+    deploy:
+      replicas: 1
+      update_config:
+        order: start-first
+        failure_action: rollback
+        parallelism: 1
+      rollback_config:
+        order: stop-first
+        parallelism: 1
+      labels:
+        - traefik.enable=true
+        - traefik.swarm.network=traefik-public
+        - traefik.http.routers.cfcgs-frontend.rule=Host(`${DOMAIN}`)
+        - traefik.http.routers.cfcgs-frontend.entrypoints=websecure
+        - traefik.http.routers.cfcgs-frontend.tls=true
+        - traefik.http.routers.cfcgs-frontend.tls.certresolver=letsencrypt
+        - traefik.http.services.cfcgs-frontend.loadbalancer.server.port=80

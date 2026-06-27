@@ -22,6 +22,13 @@ class Settings(BaseSettings):
     CHATBOT_RATE_LIMIT_WINDOW_SECONDS: int = 60
     CHATBOT_RATE_LIMIT_ENABLED: bool = True
     HEATMAP_DYNAMIC_FILTERS_ENABLED: bool = False
+    SECRET_KEY: str
+    ALGORITHM: str
+    ACCESS_TOKEN_EXPIRE_MINUTES: int
+    REFRESH_TOKEN_EXPIRE_DAYS: int = 7
+    INITIAL_ADMIN_USERNAME: str | None = None
+    INITIAL_ADMIN_EMAIL: str | None = None
+    INITIAL_ADMIN_PASSWORD: str | None = None
 
     @property
     def expected_columns_set(self) -> Set[str]:

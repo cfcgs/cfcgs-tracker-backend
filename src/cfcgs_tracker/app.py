@@ -1,4 +1,3 @@
-from contextlib import asynccontextmanager
 from collections import defaultdict, deque
 import asyncio
 import time
@@ -6,27 +5,25 @@ import time
 from fastapi import FastAPI
 from http import HTTPStatus
 
-from sqlalchemy.orm import Session
 from starlette.middleware.cors import CORSMiddleware
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
 from starlette.responses import JSONResponse
 
-from src.cfcgs_tracker.database.database import engine
-from src.cfcgs_tracker.database.seeding import create_initial_regions
-from src.cfcgs_tracker.schemas import Message
-from src.cfcgs_tracker.settings import Settings
-from src.cfcgs_tracker.routers import (
-    funds,
-    fund_types,
-    fund_focuses,
-    fund_projects,
-    commitments,
-    countries,
-    regions,
+from src.cfcgs_tracker.entrypoints.api.routers import (
+    auth,
+    beneficiary_countries,
     chatbot,
-    projects
+    fund_focuses,
+    funding_providers,
+    fund_types,
+    imports,
+    projects,
+    records,
+    users,
 )
+from src.cfcgs_tracker.entrypoints.api.schemas.common import Message
+from src.cfcgs_tracker.settings import Settings
 
 
 class RateLimitMiddleware(BaseHTTPMiddleware):
@@ -94,16 +91,7 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
         return "unknown"
 
 
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    print("Aplicação iniciando...")
-    with Session(engine) as session:
-        create_initial_regions(session)
-    yield
-    print("Aplicação encerrando.")
-
-
-app = FastAPI(lifespan=lifespan, root_path="/api")
+app = FastAPI(root_path="/api")
 settings = Settings()
 
 app.add_middleware(
@@ -119,15 +107,17 @@ app.add_middleware(
     window_seconds=settings.CHATBOT_RATE_LIMIT_WINDOW_SECONDS,
     enabled=settings.CHATBOT_RATE_LIMIT_ENABLED,
 )
-app.include_router(chatbot.router)
-app.include_router(regions.router)
-app.include_router(countries.router)
-app.include_router(commitments.router)
-app.include_router(funds.router)
+
+app.include_router(users.router)
+app.include_router(auth.router)
+app.include_router(imports.router)
 app.include_router(fund_types.router)
 app.include_router(fund_focuses.router)
-app.include_router(fund_projects.router)
+app.include_router(funding_providers.router)
+app.include_router(beneficiary_countries.router)
+app.include_router(records.router)
 app.include_router(projects.router)
+app.include_router(chatbot.router)
 
 
 @app.get("/", status_code=HTTPStatus.OK, response_model=Message)
