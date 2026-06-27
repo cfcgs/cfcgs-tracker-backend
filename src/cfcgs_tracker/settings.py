@@ -14,14 +14,11 @@ class Settings(BaseSettings):
         env_file=".env", env_file_encoding="utf-8", extra="ignore"
     )
     DATABASE_URL: str
-    EXPECTED_COLUMNS: str
-    SIMILARITY_THRESHOLD: int
     REGIONS: str
     GEMINI_API_KEY: str
     CHATBOT_RATE_LIMIT_REQUESTS: int = 30
     CHATBOT_RATE_LIMIT_WINDOW_SECONDS: int = 60
     CHATBOT_RATE_LIMIT_ENABLED: bool = True
-    HEATMAP_DYNAMIC_FILTERS_ENABLED: bool = False
     SECRET_KEY: str
     ALGORITHM: str
     ACCESS_TOKEN_EXPIRE_MINUTES: int
@@ -29,11 +26,3 @@ class Settings(BaseSettings):
     INITIAL_ADMIN_USERNAME: str | None = None
     INITIAL_ADMIN_EMAIL: str | None = None
     INITIAL_ADMIN_PASSWORD: str | None = None
-
-    @property
-    def expected_columns_set(self) -> Set[str]:
-        return comma_split_str(self.EXPECTED_COLUMNS)
-
-    @property
-    def regions_set(self) -> Set[str]:
-        return comma_split_str(self.REGIONS)
