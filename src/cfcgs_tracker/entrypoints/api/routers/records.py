@@ -18,6 +18,7 @@ from src.cfcgs_tracker.entrypoints.api.schemas.records import (
     AdminRecordPublic,
     AdminRecordUpdate,
     RecordCountryYearGridPublic,
+    RecordOverviewPublic,
     RecordCountryYearProjectList,
     RecordFilterOptionsPublic,
     RecordObjectiveTotalResponse,
@@ -49,6 +50,34 @@ ImportOperator = Annotated[User, Depends(get_current_import_operator)]
 @router.get("/years", response_model=list[int], status_code=HTTPStatus.OK)
 async def read_record_years(service: RecordServiceDep):
     return await service.get_years()
+
+
+@router.get(
+    "/overview", response_model=RecordOverviewPublic, status_code=HTTPStatus.OK
+)
+async def read_record_overview(
+    service: RecordServiceDep,
+    years: list[int] | None = Query(None, alias="year"),
+    country_ids: list[int] | None = Query(None, alias="country_id"),
+    project_ids: list[int] | None = Query(None, alias="project_id"),
+    objective: ObjectiveFilter = Query(ObjectiveFilter.all),
+    view: HeatmapView = Query(HeatmapView.country_year),
+    row_offset: int = Query(0, ge=0),
+    row_limit: int = Query(20, ge=1, le=200),
+    column_offset: int = Query(0, ge=0),
+    column_limit: int = Query(12, ge=1, le=200),
+):
+    return await service.get_overview(
+        years=years,
+        country_ids=country_ids,
+        project_ids=project_ids,
+        objective=objective.value,
+        view=view.value,
+        row_offset=row_offset,
+        row_limit=row_limit,
+        column_offset=column_offset,
+        column_limit=column_limit,
+    )
 
 
 @router.post(

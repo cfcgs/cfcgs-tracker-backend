@@ -14,7 +14,6 @@ class Settings(BaseSettings):
         env_file=".env", env_file_encoding="utf-8", extra="ignore"
     )
     DATABASE_URL: str
-    REGIONS: str
     GEMINI_API_KEY: str
     CHATBOT_RATE_LIMIT_REQUESTS: int = 30
     CHATBOT_RATE_LIMIT_WINDOW_SECONDS: int = 60

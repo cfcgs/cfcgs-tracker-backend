@@ -149,6 +149,51 @@ class RecordService:
             objective=objective,
         )
 
+    async def get_overview(
+        self,
+        *,
+        years: list[int] | None = None,
+        country_ids: list[int] | None = None,
+        project_ids: list[int] | None = None,
+        objective: str = "all",
+        view: str = "country_year",
+        row_offset: int = 0,
+        row_limit: int = 20,
+        column_offset: int = 0,
+        column_limit: int = 12,
+    ) -> dict:
+        filter_options = await self.get_filter_options(
+            years=years,
+            country_ids=country_ids,
+            project_ids=project_ids,
+            objective=objective,
+        )
+        summary = await self.get_summary(
+            years=years,
+            country_ids=country_ids,
+            project_ids=project_ids,
+            objective=objective,
+        )
+        grid = await self.get_country_year_grid(
+            years=years,
+            country_ids=country_ids,
+            project_ids=project_ids,
+            objective=objective,
+            view=view,
+            row_offset=row_offset,
+            row_limit=row_limit,
+            column_offset=column_offset,
+            column_limit=column_limit,
+        )
+        return {
+            "years": filter_options["years"],
+            "countries": filter_options["countries"],
+            "projects": filter_options["projects"],
+            "objectives": filter_options["objectives"],
+            "summary": summary,
+            "grid": grid,
+        }
+
     async def get_country_year_grid(
         self,
         *,

@@ -1,6 +1,8 @@
 services:
   cfcgs_tracker_database:
     image: postgres:16
+    env_file:
+      - .env
     volumes:
       - pgdata:/var/lib/postgresql/data
     environment:
@@ -16,12 +18,22 @@ services:
     image: cfcgs_tracker
     build: .
     entrypoint: ./entrypoint.sh
+    env_file:
+      - .env
     ports:
       - "8001:8000"
     depends_on:
       - cfcgs_tracker_database
     environment:
       DATABASE_URL: postgresql+psycopg://${DB_USER}:${DB_PASSWORD}@cfcgs_tracker_database:5432/${DB_NAME}
+      REGIONS: ${REGIONS}
+      GEMINI_API_KEY: ${GEMINI_API_KEY}
+      CHATBOT_RATE_LIMIT_REQUESTS: ${CHATBOT_RATE_LIMIT_REQUESTS}
+      CHATBOT_RATE_LIMIT_WINDOW_SECONDS: ${CHATBOT_RATE_LIMIT_WINDOW_SECONDS}
+      SECRET_KEY: ${SECRET_KEY}
+      ALGORITHM: ${ALGORITHM}
+      ACCESS_TOKEN_EXPIRE_MINUTES: ${ACCESS_TOKEN_EXPIRE_MINUTES}
+      REFRESH_TOKEN_EXPIRE_DAYS: ${REFRESH_TOKEN_EXPIRE_DAYS}
       INITIAL_ADMIN_USERNAME: ${INITIAL_ADMIN_USERNAME}
       INITIAL_ADMIN_EMAIL: ${INITIAL_ADMIN_EMAIL}
       INITIAL_ADMIN_PASSWORD: ${INITIAL_ADMIN_PASSWORD}

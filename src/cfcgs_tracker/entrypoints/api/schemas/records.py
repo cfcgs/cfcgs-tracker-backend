@@ -142,6 +142,15 @@ class RecordCountryYearGridPublic(BaseModel):
     sources: list[SourceReferencePublic]
 
 
+class RecordOverviewPublic(BaseModel):
+    years: list[int]
+    countries: list[HeatmapCountryPublic]
+    projects: list[HeatmapProjectPublic]
+    objectives: list[str]
+    summary: RecordSummaryResponse
+    grid: RecordCountryYearGridPublic
+
+
 class RecordCountryYearProjectPublic(BaseModel):
     id: int
     name: str
