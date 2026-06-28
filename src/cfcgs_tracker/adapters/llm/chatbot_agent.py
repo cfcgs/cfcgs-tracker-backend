@@ -12,6 +12,7 @@ from langchain_google_genai import ChatGoogleGenerativeAI
 from langgraph.checkpoint.memory import MemorySaver
 from langgraph.graph import END, START, StateGraph
 from sqlalchemy import text
+from sqlalchemy.exc import DBAPIError, ProgrammingError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.cfcgs_tracker.adapters.llm.prompts import (
@@ -31,15 +32,27 @@ TAGGED_RESPONSE_PATTERN = re.compile(
     r"^\s*\[(SQL|DIRECT|REFUSAL)\]\s*(.*)\s*$",
     re.IGNORECASE | re.DOTALL,
 )
+TAG_MARKER_PATTERN = re.compile(
+    r"\[(SQL|DIRECT|REFUSAL)\]",
+    re.IGNORECASE,
+)
 ALLOWED_SQL_OBJECTS = {
     "view_climate_finance_records_detailed",
     "view_provider_fund_profiles_detailed",
 }
 DEFAULT_SOURCE_LABELS = [
     {
-        "name": "OECD / Climate Funds Update / IDB",
+        "name": "OECD",
         "url": "https://www.oecd.org/",
-    }
+    },
+    {
+        "name": "Climate Funds Update",
+        "url": "https://climatefundsupdate.org/",
+    },
+    {
+        "name": "IDB",
+        "url": "https://www.iadb.org/en",
+    },
 ]
 logger = logging.getLogger("uvicorn.error")
 SUMMARY_MAX_CHARS = 900
@@ -88,7 +101,15 @@ def extract_tagged_response(response_text: str) -> tuple[str, str]:
     match = TAGGED_RESPONSE_PATTERN.match(response_text.strip())
     if not match:
         raise ValueError("Resposta do modelo sem tag esperada.")
-    return match.group(1).upper(), match.group(2).strip()
+    response_type = match.group(1).upper()
+    content = match.group(2).strip()
+    nested_tags = TAG_MARKER_PATTERN.findall(content)
+    if nested_tags:
+        raise ValueError(
+            "Faça apenas uma pergunta analítica por vez para eu responder "
+            "com precisão."
+        )
+    return response_type, content
 
 
 def normalize_sql(sql: str) -> str:
@@ -112,8 +133,14 @@ def apply_limit_offset(sql: str, *, limit: int, offset: int) -> str:
 def validate_safe_sql(sql: str) -> str:
     normalized = normalize_sql(sql)
     lowered = normalized.lower()
+    lowered_without_wrapping = lowered.lstrip("(\n\r\t ")
 
-    if not (lowered.startswith("select") or lowered.startswith("with")):
+    if not (
+        lowered.startswith("select")
+        or lowered.startswith("with")
+        or lowered_without_wrapping.startswith("select")
+        or lowered_without_wrapping.startswith("with")
+    ):
         raise UnsafeSQLQueryError("A consulta deve ser apenas de leitura.")
 
     if FORBIDDEN_SQL_PATTERN.search(normalized):
@@ -431,61 +458,74 @@ class ClimateFinanceChatbotAgent:
         page: int,
         page_size: int,
     ) -> ChatbotGraphState:
-        total_rows = await self._count_rows(sql)
-        sources = self._infer_sources(sql)
+        try:
+            total_rows = await self._count_rows(sql)
+            sources = self._infer_sources(sql)
 
-        if total_rows > page_size and not has_explicit_limit(sql):
-            answer = (
-                "Encontrei muitos resultados para essa consulta. "
-                f"Deseja que eu mostre os dados paginados em blocos de {page_size} linhas?"
+            if total_rows > page_size and not has_explicit_limit(sql):
+                answer = (
+                    "Encontrei muitos resultados para essa consulta. "
+                    f"Deseja que eu mostre os dados paginados em blocos de {page_size} linhas?"
+                )
+                return self._build_state_update(
+                    state=state,
+                    question=question,
+                    answer=sanitize_user_facing_answer(answer),
+                    sql=sql,
+                    pagination=None,
+                    needs_pagination_confirmation=True,
+                    pagination_request={
+                        "question": question,
+                        "sql": sql,
+                        "total_rows": total_rows,
+                        "page_size": page_size,
+                    },
+                    sources=sources,
+                )
+
+            rows = await self._fetch_rows(
+                sql,
+                limit=page_size,
+                offset=max(page - 1, 0) * page_size,
+                paginate=not has_explicit_limit(sql),
             )
+            answer = await self._build_final_answer(
+                question=question,
+                query=sql,
+                rows=rows,
+            )
+
+            pagination = None
+            if not has_explicit_limit(sql) and total_rows > page_size:
+                pagination = self._build_pagination_payload(
+                    page=page,
+                    page_size=page_size,
+                    total_rows=total_rows,
+                    rows=rows,
+                )
+
             return self._build_state_update(
                 state=state,
                 question=question,
                 answer=sanitize_user_facing_answer(answer),
                 sql=sql,
-                pagination=None,
-                needs_pagination_confirmation=True,
-                pagination_request={
-                    "question": question,
-                    "sql": sql,
-                    "total_rows": total_rows,
-                    "page_size": page_size,
-                },
+                pagination=pagination,
+                needs_pagination_confirmation=False,
+                pagination_request=None,
                 sources=sources,
             )
-
-        rows = await self._fetch_rows(
-            sql,
-            limit=page_size,
-            offset=max(page - 1, 0) * page_size,
-            paginate=not has_explicit_limit(sql),
-        )
-        answer = await self._build_final_answer(
-            question=question,
-            query=sql,
-            rows=rows,
-        )
-
-        pagination = None
-        if not has_explicit_limit(sql) and total_rows > page_size:
-            pagination = self._build_pagination_payload(
-                page=page,
-                page_size=page_size,
-                total_rows=total_rows,
-                rows=rows,
+        except (ProgrammingError, DBAPIError) as exc:
+            logger.warning(
+                "[chatbot] invalid generated sql | question=%s | sql=%s | detail=%s",
+                question,
+                truncate_text(sql, max_chars=600),
+                str(exc),
             )
-
-        return self._build_state_update(
-            state=state,
-            question=question,
-            answer=sanitize_user_facing_answer(answer),
-            sql=sql,
-            pagination=pagination,
-            needs_pagination_confirmation=False,
-            pagination_request=None,
-            sources=sources,
-        )
+            raise ValueError(
+                "Não consegui responder essa pergunta do jeito que ela foi "
+                "formulada. Tente dividir em perguntas menores ou ser mais "
+                "específico."
+            ) from exc
 
     def _build_shortcut_sql(self, question: str) -> str | None:
         normalized = normalize_question_text(question)
