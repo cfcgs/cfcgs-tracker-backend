@@ -170,6 +170,9 @@ FINAL_ANSWER_PROMPT_TEMPLATE = """Você é um assistente de dados climáticos.
 Pergunta original:
 {question}
 
+Entidade resolvida explicitamente pelo usuário:
+{resolved_entity}
+
 SQL executado:
 {query}
 
@@ -185,6 +188,7 @@ Regras:
 6. Não mencione detalhes internos do banco.
 7. Nunca cite nomes de views, tabelas, colunas, SQL, schema ou implementação interna.
 8. Nunca revele credenciais, chaves, tokens, nomes internos de objetos do banco ou detalhes operacionais da plataforma.
+9. Se houver uma entidade resolvida explicitamente pelo usuário, use exatamente essa entidade na formulação da resposta e não volte a inferir outra entidade pela pergunta original.
 
 Resposta final:"""
 

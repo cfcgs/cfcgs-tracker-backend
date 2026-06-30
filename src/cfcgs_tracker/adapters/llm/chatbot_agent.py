@@ -219,6 +219,11 @@ def normalize_question_text(value: str) -> str:
     return " ".join(normalized.split())
 
 
+def format_decimal_pt_br(value: float) -> str:
+    formatted = f"{value:,.2f}"
+    return formatted.replace(",", "_").replace(".", ",").replace("_", ".")
+
+
 class ClimateFinanceChatbotAgent:
     _checkpointer = MemorySaver()
 
@@ -257,6 +262,10 @@ class ClimateFinanceChatbotAgent:
         self.entity_resolution_chain = RunnableLambda(
             lambda payload: payload,
             afunc=self._entity_resolution_chain_step
+        )
+        self.selected_entity_chain = RunnableLambda(
+            lambda payload: payload,
+            afunc=self._selected_entity_chain_step
         )
         self.sql_answer_chain = RunnableLambda(
             lambda payload: payload,
@@ -322,6 +331,9 @@ class ClimateFinanceChatbotAgent:
         ):
             return await self.pagination_chain.ainvoke(turn_context)
 
+        if turn_context["disambiguation_choice"]:
+            return await self.selected_entity_chain.ainvoke(turn_context)
+
         routed_payload = await self.route_decision_chain.ainvoke(turn_context)
         return await self.dispatch_chain.ainvoke(routed_payload)
 
@@ -363,7 +375,7 @@ class ClimateFinanceChatbotAgent:
             "chat_history": payload["memory_context"],
             "resolved_entities": payload["resolved_entities"],
             "resolution_mode": payload["resolution_mode"],
-            "question": payload["question"],
+            "question": payload.get("router_question", payload["question"]),
         }
 
     def _attach_router_decision(
@@ -490,6 +502,42 @@ class ClimateFinanceChatbotAgent:
         )
         return await self.sql_answer_chain.ainvoke(rerouted_payload)
 
+    async def _selected_entity_chain_step(
+        self,
+        payload: dict[str, Any],
+    ) -> ChatbotGraphState:
+        selected_entity = payload["disambiguation_choice"]
+        rerouted_payload = {
+            **payload,
+            "resolved_entities": self._format_resolved_entities(
+                selected_entity
+            ),
+            "resolution_mode": (
+                "O usuário já escolheu explicitamente a entidade correta. "
+                "Use obrigatoriamente o `resolved_id` e o `resolved_name` "
+                "fornecidos. Não solicite nova desambiguação."
+            ),
+            "router_question": (
+                f"{payload['question']}\n\n"
+                "Entidade já escolhida pelo usuário:\n"
+                f"- tipo: {selected_entity.get('kind')}\n"
+                f"- id: {selected_entity.get('id')}\n"
+                f"- nome: {selected_entity.get('name')}\n\n"
+                "Responda usando essa entidade selecionada."
+            ),
+        }
+        rerouted_payload = await self.route_decision_chain.ainvoke(
+            rerouted_payload
+        )
+        if rerouted_payload["response_type"] == "ENTITY_RESOLUTION":
+            raise ValueError(
+                "Não consegui aplicar a entidade selecionada pelo usuário."
+            )
+        rerouted_payload["selected_entity_name"] = selected_entity.get(
+            "name"
+        )
+        return await self.dispatch_chain.ainvoke(rerouted_payload)
+
     async def _pagination_chain_step(
         self,
         payload: dict[str, Any],
@@ -511,6 +559,7 @@ class ClimateFinanceChatbotAgent:
             sql=payload["sql"],
             page=payload["page"],
             page_size=payload["page_size"],
+            resolved_entity=payload.get("selected_entity_name"),
         )
 
     def _state_update_chain_step(
@@ -676,6 +725,7 @@ class ClimateFinanceChatbotAgent:
         question: str,
         query: str,
         rows: list[dict[str, Any]],
+        resolved_entity: str | None = None,
     ) -> str:
         if not rows:
             return sanitize_user_facing_answer(
@@ -688,14 +738,64 @@ class ClimateFinanceChatbotAgent:
                 "Use a paginação para navegar pelos dados retornados."
             )
 
+        deterministic_answer = self._build_deterministic_final_answer(
+            question=question,
+            rows=rows,
+            resolved_entity=resolved_entity,
+        )
+        if deterministic_answer:
+            return sanitize_user_facing_answer(deterministic_answer)
+
         answer = await self.final_chain.ainvoke(
             {
                 "question": question,
+                "resolved_entity": (
+                    resolved_entity
+                    if resolved_entity
+                    else "Nenhuma entidade resolvida explicitamente."
+                ),
                 "query": query,
                 "response": json.dumps(rows, ensure_ascii=False, default=str),
             }
         )
         return sanitize_user_facing_answer(answer)
+
+    def _build_deterministic_final_answer(
+        self,
+        *,
+        question: str,
+        rows: list[dict[str, Any]],
+        resolved_entity: str | None,
+    ) -> str | None:
+        if not resolved_entity or len(rows) != 1:
+            return None
+
+        row = rows[0]
+        numeric_keys = [
+            key
+            for key, value in row.items()
+            if isinstance(value, (int, float)) and value is not None
+        ]
+        if len(numeric_keys) != 1:
+            return None
+
+        metric_key = numeric_keys[0]
+        metric_value = row[metric_key]
+        if metric_value is None:
+            return None
+
+        normalized_question = normalize_question_text(question)
+        if (
+            "recebeu financiamento climatico" in normalized_question
+            or "recebeu financiamento climático" in normalized_question
+        ) and metric_key == "total_amount_usd_millions":
+            return (
+                f"Sim, {resolved_entity} recebeu um financiamento climático "
+                f"total de {format_decimal_pt_br(float(metric_value))} "
+                "milhões de dólares americanos."
+            )
+
+        return None
 
     async def _answer_from_sql(
         self,
@@ -705,6 +805,7 @@ class ClimateFinanceChatbotAgent:
         sql: str,
         page: int,
         page_size: int,
+        resolved_entity: str | None = None,
     ) -> ChatbotGraphState:
         try:
             total_rows = await self._count_rows(sql)
@@ -742,6 +843,7 @@ class ClimateFinanceChatbotAgent:
                 question=question,
                 query=sql,
                 rows=rows,
+                resolved_entity=resolved_entity,
             )
 
             return self._build_state_update(

@@ -28,11 +28,16 @@ async def ask_chatbot(
 ):
     try:
         logger.info(
-            "[chatbot] incoming request | session_id=%s | page=%s | page_size=%s | confirm_pagination=%s | question=%s",
+            "[chatbot] incoming request | session_id=%s | page=%s | page_size=%s | confirm_pagination=%s | disambiguation_choice=%s | question=%s",
             query.session_id,
             query.page,
             query.page_size,
             query.confirm_pagination,
+            (
+                query.disambiguation_choice.model_dump()
+                if query.disambiguation_choice
+                else None
+            ),
             query.question,
         )
         return await service.ask(

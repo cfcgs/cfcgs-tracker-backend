@@ -3,7 +3,7 @@ from __future__ import annotations
 from typing import Any
 from uuid import uuid4
 
-from pydantic import BaseModel, Field
+from pydantic import AliasChoices, BaseModel, Field
 
 
 class ChatQuery(BaseModel):
@@ -12,7 +12,15 @@ class ChatQuery(BaseModel):
     page: int = Field(1, ge=1)
     page_size: int = Field(10, ge=1, le=100)
     confirm_pagination: bool = False
-    disambiguation_choice: DisambiguationOption | None = None
+    disambiguation_choice: DisambiguationOption | None = Field(
+        default=None,
+        validation_alias=AliasChoices(
+            "disambiguation_choice",
+            "disambiguationChoice",
+            "resolved_entity",
+            "resolvedEntity",
+        ),
+    )
 
 
 class PaginationResult(BaseModel):
