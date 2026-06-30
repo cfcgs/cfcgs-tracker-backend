@@ -1,17 +1,20 @@
 from __future__ import annotations
 
+from __future__ import annotations
+
 from typing import Any
+from uuid import uuid4
 
 from pydantic import BaseModel, Field
 
 
 class ChatQuery(BaseModel):
     question: str
-    session_id: str = "default"
+    session_id: str | None = Field(default_factory=lambda: str(uuid4()))
     page: int = Field(1, ge=1)
     page_size: int = Field(10, ge=1, le=100)
     confirm_pagination: bool = False
-    disambiguation_choice: dict[str, str] | None = None
+    disambiguation_choice: DisambiguationOption | None = None
 
 
 class PaginationResult(BaseModel):
@@ -28,6 +31,7 @@ class ChatSource(BaseModel):
 
 
 class DisambiguationOption(BaseModel):
+    id: int | None = None
     name: str
     kind: str
 
@@ -39,6 +43,7 @@ class DisambiguationPayload(BaseModel):
 
 
 class ChatResponse(BaseModel):
+    session_id: str
     answer: str
     needs_pagination_confirmation: bool = False
     pagination: PaginationResult | None = None

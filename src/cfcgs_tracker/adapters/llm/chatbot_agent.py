@@ -6,6 +6,7 @@ import re
 import time
 from typing import Any, TypedDict
 
+from fuzzywuzzy import fuzz, process
 from langchain_core.output_parsers import StrOutputParser
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_google_genai import ChatGoogleGenerativeAI
@@ -29,11 +30,11 @@ FORBIDDEN_SQL_PATTERN = re.compile(
 )
 LIMIT_PATTERN = re.compile(r"\blimit\s+\d+\b", re.IGNORECASE)
 TAGGED_RESPONSE_PATTERN = re.compile(
-    r"^\s*\[(SQL|DIRECT|REFUSAL)\]\s*(.*)\s*$",
+    r"^\s*\[(SQL|DIRECT|REFUSAL|ENTITY_RESOLUTION)\]\s*(.*)\s*$",
     re.IGNORECASE | re.DOTALL,
 )
 TAG_MARKER_PATTERN = re.compile(
-    r"\[(SQL|DIRECT|REFUSAL)\]",
+    r"\[(SQL|DIRECT|REFUSAL|ENTITY_RESOLUTION)\]",
     re.IGNORECASE,
 )
 ALLOWED_SQL_OBJECTS = {
@@ -63,15 +64,6 @@ INTERNAL_TERMS_PATTERN = re.compile(
     r"\b(view_[a-zA-Z0-9_]+|table|tables|tabela|tabelas|column|columns|coluna|colunas|schema|sql|database|banco de dados)\b",
     re.IGNORECASE,
 )
-COUNTRY_ALIASES = {
-    "brasil": ["Brazil", "Brasil"],
-    "bolivia": ["Bolivia", "Bolívia"],
-    "africa do sul": ["South Africa", "África do Sul"],
-    "africa subsaariana": [
-        "Sub-Saharan Africa",
-        "África Subsaariana",
-    ],
-}
 
 
 class ChatbotGraphState(TypedDict, total=False):
@@ -79,7 +71,7 @@ class ChatbotGraphState(TypedDict, total=False):
     page: int
     page_size: int
     confirm_pagination: bool
-    disambiguation_choice: dict[str, str] | None
+    disambiguation_choice: dict[str, Any] | None
     answer: str
     needs_pagination_confirmation: bool
     pagination: dict[str, Any] | None
@@ -97,7 +89,7 @@ class UnsafeSQLQueryError(Exception):
     """Raised when the generated SQL is unsafe or invalid."""
 
 
-def extract_tagged_response(response_text: str) -> tuple[str, str]:
+def parse_router_response(response_text: str) -> tuple[str, str | dict[str, str]]:
     match = TAGGED_RESPONSE_PATTERN.match(response_text.strip())
     if not match:
         raise ValueError("Resposta do modelo sem tag esperada.")
@@ -109,6 +101,23 @@ def extract_tagged_response(response_text: str) -> tuple[str, str]:
             "Faça apenas uma pergunta analítica por vez para eu responder "
             "com precisão."
         )
+    if response_type == "ENTITY_RESOLUTION":
+        try:
+            payload = json.loads(content)
+        except json.JSONDecodeError as exc:
+            raise ValueError(
+                "Resposta do modelo inválida para resolução de entidade."
+            ) from exc
+        entity_type = str(payload.get("entity_type", "")).strip().lower()
+        search_term = str(payload.get("search_term", "")).strip()
+        if not entity_type or not search_term:
+            raise ValueError(
+                "Resposta do modelo incompleta para resolução de entidade."
+            )
+        return response_type, {
+            "entity_type": entity_type,
+            "search_term": search_term,
+        }
     return response_type, content
 
 
@@ -134,6 +143,11 @@ def validate_safe_sql(sql: str) -> str:
     normalized = normalize_sql(sql)
     lowered = normalized.lower()
     lowered_without_wrapping = lowered.lstrip("(\n\r\t ")
+    sql_without_string_literals = re.sub(
+        r"'(?:''|[^'])*'",
+        "''",
+        normalized,
+    )
 
     if not (
         lowered.startswith("select")
@@ -143,7 +157,7 @@ def validate_safe_sql(sql: str) -> str:
     ):
         raise UnsafeSQLQueryError("A consulta deve ser apenas de leitura.")
 
-    if FORBIDDEN_SQL_PATTERN.search(normalized):
+    if FORBIDDEN_SQL_PATTERN.search(sql_without_string_literals):
         raise UnsafeSQLQueryError(
             "A consulta gerada contém operação proibida."
         )
@@ -230,11 +244,11 @@ class ClimateFinanceChatbotAgent:
         self,
         *,
         question: str,
-        session_id: str = "default",
+        session_id: str,
         page: int = 1,
         page_size: int = 10,
         confirm_pagination: bool = False,
-        disambiguation_choice: dict[str, str] | None = None,
+        disambiguation_choice: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         result = await self.graph.ainvoke(
             {
@@ -248,12 +262,14 @@ class ClimateFinanceChatbotAgent:
         )
 
         return self._build_response(
+            session_id=session_id,
             answer=result["answer"],
             needs_pagination_confirmation=result.get(
                 "needs_pagination_confirmation", False
             ),
             pagination=result.get("pagination"),
             sources=result.get("sources"),
+            disambiguation=result.get("disambiguation"),
         )
 
     def _build_graph(self):
@@ -272,6 +288,7 @@ class ClimateFinanceChatbotAgent:
         page_size = state.get("page_size", 10)
         confirm_pagination = state.get("confirm_pagination", False)
         pagination_request = state.get("pagination_request")
+        disambiguation_choice = state.get("disambiguation_choice")
 
         if confirm_pagination and pagination_request:
             return await self._handle_pagination_confirmation(
@@ -281,42 +298,22 @@ class ClimateFinanceChatbotAgent:
                 pagination_request=pagination_request,
             )
 
-        shortcut_sql = self._build_shortcut_sql(question)
-        if shortcut_sql:
-            logger.info(
-                "[chatbot] using shortcut sql | question=%s | sql=%s",
-                question,
-                shortcut_sql,
-            )
-            return await self._answer_from_sql(
-                state=state,
-                question=question,
-                sql=shortcut_sql,
-                page=page,
-                page_size=page_size,
-            )
-
         memory_context = self._format_memory_context(state)
-        raw_response = await self.router_chain.ainvoke(
-            {
-                "schema": CHATBOT_SCHEMA_DESCRIPTION,
-                "chat_history": memory_context,
-                "question": question,
-                "examples": SQL_EXAMPLES,
-            }
+        resolved_entities = self._format_resolved_entities(
+            disambiguation_choice
         )
-        logger.info(
-            "[chatbot] llm raw response | question=%s | response=%s",
-            question,
-            truncate_text(raw_response, max_chars=600),
+        response_type, content = await self._route_question(
+            question=question,
+            memory_context=memory_context,
+            resolved_entities=resolved_entities,
+            resolution_mode="Nenhuma restrição adicional.",
         )
-        response_type, content = extract_tagged_response(raw_response)
 
         if response_type == "REFUSAL":
             return self._build_state_update(
                 state=state,
                 question=question,
-                answer=sanitize_user_facing_answer(content),
+                answer=sanitize_user_facing_answer(str(content)),
                 sql=None,
                 pagination=None,
                 needs_pagination_confirmation=False,
@@ -328,7 +325,7 @@ class ClimateFinanceChatbotAgent:
             return self._build_state_update(
                 state=state,
                 question=question,
-                answer=sanitize_user_facing_answer(content),
+                answer=sanitize_user_facing_answer(str(content)),
                 sql=None,
                 pagination=None,
                 needs_pagination_confirmation=False,
@@ -336,7 +333,49 @@ class ClimateFinanceChatbotAgent:
                 sources=None,
             )
 
-        sql = validate_safe_sql(content)
+        if response_type == "ENTITY_RESOLUTION":
+            resolution = await self._resolve_entity_request(
+                question=question,
+                payload=content,
+            )
+            if resolution is not None:
+                auto_resolved_choice = resolution.get("resolved_choice")
+                if auto_resolved_choice:
+                    response_type, content = await self._route_question(
+                        question=question,
+                        memory_context=memory_context,
+                        resolved_entities=self._format_resolved_entities(
+                            auto_resolved_choice
+                        ),
+                        resolution_mode=(
+                            "As entidades desta pergunta já foram resolvidas. "
+                            "Use os campos `resolved_id` e `resolved_name` "
+                            "fornecidos e não retorne [ENTITY_RESOLUTION] "
+                            "novamente."
+                        ),
+                    )
+                    if response_type != "SQL":
+                        raise ValueError(
+                            "Não consegui gerar a consulta após resolver a entidade."
+                        )
+                else:
+                    return self._build_state_update(
+                        state=state,
+                        question=question,
+                        answer=resolution["message"],
+                        sql=None,
+                        pagination=None,
+                        needs_pagination_confirmation=False,
+                        pagination_request=None,
+                        sources=None,
+                        disambiguation=resolution["disambiguation"],
+                    )
+            else:
+                raise ValueError(
+                    "Não consegui resolver a entidade para continuar a consulta."
+                )
+
+        sql = validate_safe_sql(str(content))
         logger.info(
             "[chatbot] generated sql | question=%s | sql=%s", question, sql
         )
@@ -347,6 +386,96 @@ class ClimateFinanceChatbotAgent:
             page=page,
             page_size=page_size,
         )
+
+    async def _route_question(
+        self,
+        *,
+        question: str,
+        memory_context: str,
+        resolved_entities: str,
+        resolution_mode: str,
+    ) -> tuple[str, str | dict[str, str]]:
+        raw_response = await self.router_chain.ainvoke(
+            {
+                "schema": CHATBOT_SCHEMA_DESCRIPTION,
+                "chat_history": memory_context,
+                "resolved_entities": resolved_entities,
+                "resolution_mode": resolution_mode,
+                "question": question,
+                "examples": SQL_EXAMPLES,
+            }
+        )
+        logger.info(
+            "[chatbot] llm raw response | question=%s | response=%s",
+            question,
+            truncate_text(raw_response, max_chars=600),
+        )
+        return parse_router_response(raw_response)
+
+    def _format_resolved_entities(
+        self,
+        disambiguation_choice: dict[str, Any] | None,
+    ) -> str:
+        if not disambiguation_choice:
+            return "Nenhuma entidade resolvida previamente."
+
+        return json.dumps(
+            [
+                {
+                    "entity_type": disambiguation_choice.get("kind"),
+                    "resolved_name": disambiguation_choice.get("name"),
+                    "resolved_id": disambiguation_choice.get("id"),
+                }
+            ],
+            ensure_ascii=False,
+        )
+
+    async def _resolve_entity_request(
+        self,
+        *,
+        question: str,
+        payload: dict[str, str],
+    ) -> dict[str, Any] | None:
+        entity_type = payload["entity_type"]
+        search_term = payload["search_term"]
+        resolver_map = {
+            "country": self._find_matching_countries,
+            "sector": self._find_matching_sectors,
+            "sub_sector": self._find_matching_sub_sectors,
+            "project": self._find_matching_projects,
+            "funding_provider": self._find_matching_funding_providers,
+            "financial_instrument": self._find_matching_financial_instruments,
+            "source": self._find_matching_sources,
+        }
+        resolver = resolver_map.get(entity_type)
+        if not resolver:
+            raise ValueError(
+                "No momento esse tipo de resolução de entidade não é suportado."
+            )
+        options = await resolver(search_term)
+        if not options:
+            raise ValueError(
+                "Não encontrei entidades compatíveis com o termo informado."
+            )
+        if len(options) == 1:
+            return {
+                "resolved_choice": options[0],
+            }
+
+        return {
+            "message": (
+                f'Encontrei mais de uma opção possível para "{search_term}". '
+                "Qual delas você quer consultar?"
+            ),
+            "disambiguation": {
+                "message": (
+                    f'Encontrei mais de uma opção possível para "{search_term}". '
+                    "Escolha uma das opções."
+                ),
+                "options": options,
+                "mode": "select",
+            },
+        }
 
     async def _handle_pagination_confirmation(
         self,
@@ -527,70 +656,286 @@ class ClimateFinanceChatbotAgent:
                 "específico."
             ) from exc
 
-    def _build_shortcut_sql(self, question: str) -> str | None:
-        normalized = normalize_question_text(question)
+    async def _find_matching_countries(
+        self,
+        search_term: str,
+    ) -> list[dict[str, Any]]:
+        return await self._find_matching_entities(
+            search_term=search_term,
+            entities=await self._list_beneficiary_countries(),
+            kind="country",
+        )
 
-        if (
-            "setor" in normalized
-            and "subsetor" in normalized
-            and "mais recebeu" in normalized
-        ):
-            return """
-SELECT
-    cfrd.sector_name,
-    cfrd.sub_sector_name,
-    SUM(cfrd.total_amount_usd_millions) AS total_amount_usd_millions
-FROM view_climate_finance_records_detailed cfrd
-WHERE cfrd.sector_name IS NOT NULL
-  AND cfrd.sub_sector_name IS NOT NULL
-GROUP BY cfrd.sector_name, cfrd.sub_sector_name
-ORDER BY total_amount_usd_millions DESC NULLS LAST
-LIMIT 1
-""".strip()
+    async def _find_matching_sectors(
+        self,
+        search_term: str,
+    ) -> list[dict[str, Any]]:
+        return await self._find_matching_entities(
+            search_term=search_term,
+            entities=await self._list_sectors(),
+            kind="sector",
+        )
 
-        if (
-            ("pais" in normalized or "país" in question.lower())
-            and "mais recebeu" in normalized
-            and "financiamento" in normalized
-        ):
-            return """
-SELECT
-    cfrd.beneficiary_country_name,
-    SUM(cfrd.total_amount_usd_millions) AS total_amount_usd_millions
+    async def _find_matching_sub_sectors(
+        self,
+        search_term: str,
+    ) -> list[dict[str, Any]]:
+        return await self._find_matching_entities(
+            search_term=search_term,
+            entities=await self._list_sub_sectors(),
+            kind="sub_sector",
+        )
+
+    async def _find_matching_projects(
+        self,
+        search_term: str,
+    ) -> list[dict[str, Any]]:
+        return await self._find_matching_entities(
+            search_term=search_term,
+            entities=await self._list_projects(),
+            kind="project",
+        )
+
+    async def _find_matching_funding_providers(
+        self,
+        search_term: str,
+    ) -> list[dict[str, Any]]:
+        return await self._find_matching_entities(
+            search_term=search_term,
+            entities=await self._list_funding_providers(),
+            kind="funding_provider",
+        )
+
+    async def _find_matching_financial_instruments(
+        self,
+        search_term: str,
+    ) -> list[dict[str, Any]]:
+        return await self._find_matching_entities(
+            search_term=search_term,
+            entities=await self._list_financial_instruments(),
+            kind="financial_instrument",
+        )
+
+    async def _find_matching_sources(
+        self,
+        search_term: str,
+    ) -> list[dict[str, Any]]:
+        return await self._find_matching_entities(
+            search_term=search_term,
+            entities=await self._list_sources(),
+            kind="source",
+        )
+
+    async def _find_matching_entities(
+        self,
+        *,
+        search_term: str,
+        entities: list[dict[str, Any]],
+        kind: str,
+    ) -> list[dict[str, Any]]:
+        if not search_term:
+            return []
+
+        matched_names = self._rank_entity_candidates(
+            search_term=search_term,
+            entity_names=[entity["name"] for entity in entities],
+        )
+        by_name = {entity["name"]: entity for entity in entities}
+        return [
+            {
+                "id": by_name[name].get("id"),
+                "name": name,
+                "kind": kind,
+            }
+            for name in matched_names
+            if name in by_name
+        ]
+
+    async def _list_beneficiary_countries(self) -> list[dict[str, Any]]:
+        result = await self.session.execute(
+            text(
+                """
+SELECT DISTINCT
+  cfrd.beneficiary_country_id AS entity_id,
+  cfrd.beneficiary_country_name AS entity_name
 FROM view_climate_finance_records_detailed cfrd
 WHERE cfrd.beneficiary_country_name IS NOT NULL
   AND cfrd.beneficiary_country_name NOT ILIKE 'Global%'
   AND cfrd.beneficiary_country_name NOT ILIKE 'Multi-country%'
   AND cfrd.beneficiary_country_name NOT ILIKE 'Regional%'
-GROUP BY cfrd.beneficiary_country_name
-ORDER BY total_amount_usd_millions DESC NULLS LAST
-LIMIT 1
-""".strip()
-
-        country_match = re.search(
-            r"quanto\s+(?:o|a)?\s*(?P<country>.+?)\s+recebeu",
-            normalized,
+ORDER BY cfrd.beneficiary_country_name
+"""
+            )
         )
-        if country_match and "financiamento" in normalized:
-            country_key = country_match.group("country").strip()
-            aliases = COUNTRY_ALIASES.get(country_key)
-            if aliases:
-                clauses = [
-                    f"cfrd.beneficiary_country_name ILIKE '{alias}'"
-                    for alias in aliases
-                ]
-            else:
-                original = country_match.group("country").strip().title()
-                clauses = [f"cfrd.beneficiary_country_name ILIKE '{original}'"]
-            where_clause = " OR ".join(clauses)
-            return f"""
-SELECT
-    SUM(cfrd.total_amount_usd_millions) AS total_amount_usd_millions
-FROM view_climate_finance_records_detailed cfrd
-WHERE ({where_clause})
-""".strip()
+        return [
+            {"id": row.entity_id, "name": row.entity_name}
+            for row in result
+            if row.entity_name
+        ]
 
-        return None
+    async def _list_sectors(self) -> list[dict[str, Any]]:
+        result = await self.session.execute(
+            text(
+                """
+SELECT DISTINCT
+  cfrd.sector_id AS entity_id,
+  cfrd.sector_name AS entity_name
+FROM view_climate_finance_records_detailed cfrd
+WHERE cfrd.sector_name IS NOT NULL
+ORDER BY cfrd.sector_name
+"""
+            )
+        )
+        return [
+            {"id": row.entity_id, "name": row.entity_name}
+            for row in result
+            if row.entity_name
+        ]
+
+    async def _list_sub_sectors(self) -> list[dict[str, Any]]:
+        result = await self.session.execute(
+            text(
+                """
+SELECT DISTINCT
+  cfrd.sub_sector_id AS entity_id,
+  cfrd.sub_sector_name AS entity_name
+FROM view_climate_finance_records_detailed cfrd
+WHERE cfrd.sub_sector_name IS NOT NULL
+ORDER BY cfrd.sub_sector_name
+"""
+            )
+        )
+        return [
+            {"id": row.entity_id, "name": row.entity_name}
+            for row in result
+            if row.entity_name
+        ]
+
+    async def _list_projects(self) -> list[dict[str, Any]]:
+        result = await self.session.execute(
+            text(
+                """
+SELECT DISTINCT
+  cfrd.project_id AS entity_id,
+  cfrd.project_title AS entity_name
+FROM view_climate_finance_records_detailed cfrd
+WHERE cfrd.project_title IS NOT NULL
+ORDER BY cfrd.project_title
+"""
+            )
+        )
+        return [
+            {"id": row.entity_id, "name": row.entity_name}
+            for row in result
+            if row.entity_name
+        ]
+
+    async def _list_funding_providers(self) -> list[dict[str, Any]]:
+        result = await self.session.execute(
+            text(
+                """
+SELECT DISTINCT
+  cfrd.funding_provider_id AS entity_id,
+  cfrd.funding_provider_name AS entity_name
+FROM view_climate_finance_records_detailed cfrd
+WHERE cfrd.funding_provider_name IS NOT NULL
+ORDER BY cfrd.funding_provider_name
+"""
+            )
+        )
+        return [
+            {"id": row.entity_id, "name": row.entity_name}
+            for row in result
+            if row.entity_name
+        ]
+
+    async def _list_financial_instruments(self) -> list[dict[str, Any]]:
+        result = await self.session.execute(
+            text(
+                """
+SELECT DISTINCT
+  cfrd.financial_instrument_id AS entity_id,
+  cfrd.financial_instrument_name AS entity_name
+FROM view_climate_finance_records_detailed cfrd
+WHERE cfrd.financial_instrument_name IS NOT NULL
+ORDER BY cfrd.financial_instrument_name
+"""
+            )
+        )
+        return [
+            {"id": row.entity_id, "name": row.entity_name}
+            for row in result
+            if row.entity_name
+        ]
+
+    async def _list_sources(self) -> list[dict[str, Any]]:
+        result = await self.session.execute(
+            text(
+                """
+SELECT DISTINCT
+  cfrd.source_id AS entity_id,
+  cfrd.source_name AS entity_name
+FROM view_climate_finance_records_detailed cfrd
+WHERE cfrd.source_name IS NOT NULL
+ORDER BY cfrd.source_name
+"""
+            )
+        )
+        return [
+            {"id": row.entity_id, "name": row.entity_name}
+            for row in result
+            if row.entity_name
+        ]
+
+    def _rank_entity_candidates(
+        self,
+        *,
+        search_term: str,
+        entity_names: list[str],
+    ) -> list[str]:
+        normalized_term = normalize_question_text(search_term)
+        if not normalized_term:
+            return []
+
+        normalized_to_originals: dict[str, list[str]] = {}
+        for entity_name in entity_names:
+            normalized_name = normalize_question_text(entity_name)
+            normalized_to_originals.setdefault(normalized_name, []).append(
+                entity_name
+            )
+
+        exact_or_contains_matches = [
+            entity_name
+            for entity_name in entity_names
+            if normalized_term in normalize_question_text(entity_name)
+        ]
+        if exact_or_contains_matches:
+            return exact_or_contains_matches[:10]
+
+        fuzzy_matches = process.extract(
+            normalized_term,
+            list(normalized_to_originals.keys()),
+            scorer=fuzz.WRatio,
+            limit=10,
+        )
+        ranked_matches: list[str] = []
+        fallback_matches: list[str] = []
+        for normalized_name, score in fuzzy_matches:
+            if score >= 45:
+                for entity_name in normalized_to_originals[normalized_name]:
+                    if entity_name not in ranked_matches:
+                        ranked_matches.append(entity_name)
+                continue
+            if score < 35:
+                continue
+            for entity_name in normalized_to_originals[normalized_name]:
+                if entity_name not in fallback_matches:
+                    fallback_matches.append(entity_name)
+
+        if ranked_matches:
+            return ranked_matches[:10]
+        return fallback_matches[:5]
+
 
     def _infer_sources(self, sql: str) -> list[dict[str, str]] | None:
         lowered = sql.lower()
@@ -617,17 +962,20 @@ WHERE ({where_clause})
     def _build_response(
         self,
         *,
+        session_id: str,
         answer: str,
         needs_pagination_confirmation: bool = False,
         pagination: dict[str, Any] | None = None,
         sources: list[dict[str, str]] | None = None,
+        disambiguation: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         return {
+            "session_id": session_id,
             "answer": answer,
             "needs_pagination_confirmation": (needs_pagination_confirmation),
             "pagination": pagination,
             "sources": sources,
-            "disambiguation": None,
+            "disambiguation": disambiguation,
         }
 
     def _build_state_update(
@@ -641,6 +989,7 @@ WHERE ({where_clause})
         needs_pagination_confirmation: bool,
         pagination_request: dict[str, Any] | None,
         sources: list[dict[str, str]] | None,
+        disambiguation: dict[str, Any] | None = None,
     ) -> ChatbotGraphState:
         summary = self._update_summary(
             state.get("summary", ""),
@@ -653,7 +1002,7 @@ WHERE ({where_clause})
             "needs_pagination_confirmation": (needs_pagination_confirmation),
             "pagination": pagination,
             "sources": sources,
-            "disambiguation": None,
+            "disambiguation": disambiguation,
             "summary": summary,
             "last_question": question,
             "last_answer": answer,

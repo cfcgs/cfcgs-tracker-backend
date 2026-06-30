@@ -41,7 +41,11 @@ async def ask_chatbot(
             page=query.page,
             page_size=query.page_size,
             confirm_pagination=query.confirm_pagination,
-            disambiguation_choice=query.disambiguation_choice,
+            disambiguation_choice=(
+                query.disambiguation_choice.model_dump()
+                if query.disambiguation_choice
+                else None
+            ),
         )
     except UnsafeSQLQueryError as exc:
         logger.warning(
