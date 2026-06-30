@@ -3,16 +3,16 @@ import pytest
 from src.cfcgs_tracker.adapters.llm.chatbot_agent import (
     UnsafeSQLQueryError,
     apply_limit_offset,
-    extract_tagged_response,
     has_explicit_limit,
     normalize_question_text,
+    parse_router_response,
     sanitize_user_facing_answer,
     validate_safe_sql,
 )
 
 
-def test_extract_tagged_response_parses_sql_payload():
-    response_type, content = extract_tagged_response(
+def test_parse_router_response_parses_sql_payload():
+    response_type, content = parse_router_response(
         "[SQL] SELECT * FROM view_climate_finance_records_detailed"
     )
 

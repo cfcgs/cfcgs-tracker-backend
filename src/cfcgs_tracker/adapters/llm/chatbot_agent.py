@@ -9,6 +9,7 @@ from typing import Any, TypedDict
 from fuzzywuzzy import fuzz, process
 from langchain_core.output_parsers import StrOutputParser
 from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.runnables import RunnableLambda, RunnablePassthrough
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langgraph.checkpoint.memory import MemorySaver
 from langgraph.graph import END, START, StateGraph
@@ -17,10 +18,9 @@ from sqlalchemy.exc import DBAPIError, ProgrammingError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.cfcgs_tracker.adapters.llm.prompts import (
-    CHATBOT_SCHEMA_DESCRIPTION,
     FINAL_ANSWER_PROMPT_TEMPLATE,
-    ROUTER_PROMPT_TEMPLATE,
-    SQL_EXAMPLES,
+    build_router_prompt,
+    get_table_details,
 )
 from src.cfcgs_tracker.settings import Settings
 
@@ -89,7 +89,9 @@ class UnsafeSQLQueryError(Exception):
     """Raised when the generated SQL is unsafe or invalid."""
 
 
-def parse_router_response(response_text: str) -> tuple[str, str | dict[str, str]]:
+def parse_router_response(
+    response_text: str,
+) -> tuple[str, str | dict[str, str]]:
     match = TAGGED_RESPONSE_PATTERN.match(response_text.strip())
     if not match:
         raise ValueError("Resposta do modelo sem tag esperada.")
@@ -229,14 +231,43 @@ class ClimateFinanceChatbotAgent:
             google_api_key=self.settings.GEMINI_API_KEY,
         )
         self.router_chain = (
-            ChatPromptTemplate.from_template(ROUTER_PROMPT_TEMPLATE)
-            | self.llm
-            | StrOutputParser()
+            build_router_prompt() | self.llm | StrOutputParser()
         )
         self.final_chain = (
             ChatPromptTemplate.from_template(FINAL_ANSWER_PROMPT_TEMPLATE)
             | self.llm
             | StrOutputParser()
+        )
+        self.context_chain = RunnableLambda(
+            self._extract_turn_context
+        ) | RunnableLambda(self._enrich_turn_context)
+        self.route_decision_chain = (
+            RunnablePassthrough.assign(
+                raw_router_response=(
+                    RunnableLambda(self._build_router_prompt_payload)
+                    | self.router_chain
+                )
+            )
+            | RunnableLambda(self._attach_router_decision)
+        )
+        self.pagination_chain = RunnableLambda(
+            lambda payload: payload,
+            afunc=self._pagination_chain_step
+        )
+        self.entity_resolution_chain = RunnableLambda(
+            lambda payload: payload,
+            afunc=self._entity_resolution_chain_step
+        )
+        self.sql_answer_chain = RunnableLambda(
+            lambda payload: payload,
+            afunc=self._sql_answer_chain_step
+        )
+        self.state_update_chain = RunnableLambda(
+            self._state_update_chain_step
+        )
+        self.dispatch_chain = RunnableLambda(
+            lambda payload: payload,
+            afunc=self._dispatch_chain_step,
         )
         self.graph = self._build_graph()
 
@@ -283,134 +314,222 @@ class ClimateFinanceChatbotAgent:
         self,
         state: ChatbotGraphState,
     ) -> ChatbotGraphState:
-        question = state["question"]
-        page = state.get("page", 1)
-        page_size = state.get("page_size", 10)
-        confirm_pagination = state.get("confirm_pagination", False)
-        pagination_request = state.get("pagination_request")
-        disambiguation_choice = state.get("disambiguation_choice")
+        turn_context = await self.context_chain.ainvoke(state)
 
-        if confirm_pagination and pagination_request:
-            return await self._handle_pagination_confirmation(
-                state=state,
-                page=page,
-                page_size=page_size,
-                pagination_request=pagination_request,
-            )
+        if (
+            turn_context["confirm_pagination"]
+            and turn_context["pagination_request"]
+        ):
+            return await self.pagination_chain.ainvoke(turn_context)
 
-        memory_context = self._format_memory_context(state)
-        resolved_entities = self._format_resolved_entities(
-            disambiguation_choice
+        routed_payload = await self.route_decision_chain.ainvoke(turn_context)
+        return await self.dispatch_chain.ainvoke(routed_payload)
+
+    def _extract_turn_context(
+        self,
+        state: ChatbotGraphState,
+    ) -> dict[str, Any]:
+        return {
+            "state": state,
+            "question": state["question"],
+            "page": state.get("page", 1),
+            "page_size": state.get("page_size", 10),
+            "confirm_pagination": state.get("confirm_pagination", False),
+            "pagination_request": state.get("pagination_request"),
+            "disambiguation_choice": state.get("disambiguation_choice"),
+        }
+
+    def _enrich_turn_context(
+        self,
+        turn_context: dict[str, Any],
+    ) -> dict[str, Any]:
+        state = turn_context["state"]
+        turn_context["memory_context"] = self._format_memory_context(state)
+        turn_context["resolved_entities"] = self._format_resolved_entities(
+            turn_context.get("disambiguation_choice")
         )
-        response_type, content = await self._route_question(
-            question=question,
-            memory_context=memory_context,
-            resolved_entities=resolved_entities,
-            resolution_mode="Nenhuma restrição adicional.",
+        turn_context.setdefault(
+            "resolution_mode",
+            "Nenhuma restrição adicional.",
         )
+        return turn_context
+
+    def _build_router_prompt_payload(
+        self,
+        payload: dict[str, Any],
+    ) -> dict[str, Any]:
+        return {
+            "schema": get_table_details(),
+            "chat_history": payload["memory_context"],
+            "resolved_entities": payload["resolved_entities"],
+            "resolution_mode": payload["resolution_mode"],
+            "question": payload["question"],
+        }
+
+    def _attach_router_decision(
+        self,
+        payload: dict[str, Any],
+    ) -> dict[str, Any]:
+        logger.info(
+            "[chatbot] llm raw response | question=%s | response=%s",
+            payload["question"],
+            truncate_text(payload["raw_router_response"], max_chars=600),
+        )
+        response_type, content = parse_router_response(
+            payload["raw_router_response"]
+        )
+        payload["response_type"] = response_type
+        payload["content"] = content
+        return payload
+
+    async def _dispatch_chain_step(
+        self,
+        payload: dict[str, Any],
+    ) -> ChatbotGraphState:
+        response_type = payload["response_type"]
 
         if response_type == "REFUSAL":
-            return self._build_state_update(
-                state=state,
-                question=question,
-                answer=sanitize_user_facing_answer(str(content)),
-                sql=None,
-                pagination=None,
-                needs_pagination_confirmation=False,
-                pagination_request=None,
-                sources=None,
+            return await self.state_update_chain.ainvoke(
+                {
+                    "state": payload["state"],
+                    "question": payload["question"],
+                    "answer": sanitize_user_facing_answer(
+                        str(payload["content"])
+                    ),
+                    "sql": None,
+                    "pagination": None,
+                    "needs_pagination_confirmation": False,
+                    "pagination_request": None,
+                    "sources": None,
+                }
             )
 
         if response_type == "DIRECT":
-            return self._build_state_update(
-                state=state,
-                question=question,
-                answer=sanitize_user_facing_answer(str(content)),
-                sql=None,
-                pagination=None,
-                needs_pagination_confirmation=False,
-                pagination_request=None,
-                sources=None,
+            return await self.state_update_chain.ainvoke(
+                {
+                    "state": payload["state"],
+                    "question": payload["question"],
+                    "answer": sanitize_user_facing_answer(
+                        str(payload["content"])
+                    ),
+                    "sql": None,
+                    "pagination": None,
+                    "needs_pagination_confirmation": False,
+                    "pagination_request": None,
+                    "sources": None,
+                }
             )
 
         if response_type == "ENTITY_RESOLUTION":
-            resolution = await self._resolve_entity_request(
-                question=question,
-                payload=content,
-            )
-            if resolution is not None:
-                auto_resolved_choice = resolution.get("resolved_choice")
-                if auto_resolved_choice:
-                    response_type, content = await self._route_question(
-                        question=question,
-                        memory_context=memory_context,
-                        resolved_entities=self._format_resolved_entities(
-                            auto_resolved_choice
-                        ),
-                        resolution_mode=(
-                            "As entidades desta pergunta já foram resolvidas. "
-                            "Use os campos `resolved_id` e `resolved_name` "
-                            "fornecidos e não retorne [ENTITY_RESOLUTION] "
-                            "novamente."
-                        ),
-                    )
-                    if response_type != "SQL":
-                        raise ValueError(
-                            "Não consegui gerar a consulta após resolver a entidade."
-                        )
-                else:
-                    return self._build_state_update(
-                        state=state,
-                        question=question,
-                        answer=resolution["message"],
-                        sql=None,
-                        pagination=None,
-                        needs_pagination_confirmation=False,
-                        pagination_request=None,
-                        sources=None,
-                        disambiguation=resolution["disambiguation"],
-                    )
-            else:
-                raise ValueError(
-                    "Não consegui resolver a entidade para continuar a consulta."
-                )
+            return await self.entity_resolution_chain.ainvoke(payload)
 
-        sql = validate_safe_sql(str(content))
+        payload["sql"] = validate_safe_sql(str(payload["content"]))
         logger.info(
-            "[chatbot] generated sql | question=%s | sql=%s", question, sql
+            "[chatbot] generated sql | question=%s | sql=%s",
+            payload["question"],
+            payload["sql"],
         )
-        return await self._answer_from_sql(
-            state=state,
-            question=question,
-            sql=sql,
-            page=page,
-            page_size=page_size,
-        )
+        return await self.sql_answer_chain.ainvoke(payload)
 
-    async def _route_question(
+    async def _entity_resolution_chain_step(
         self,
-        *,
-        question: str,
-        memory_context: str,
-        resolved_entities: str,
-        resolution_mode: str,
-    ) -> tuple[str, str | dict[str, str]]:
-        raw_response = await self.router_chain.ainvoke(
-            {
-                "schema": CHATBOT_SCHEMA_DESCRIPTION,
-                "chat_history": memory_context,
-                "resolved_entities": resolved_entities,
-                "resolution_mode": resolution_mode,
-                "question": question,
-                "examples": SQL_EXAMPLES,
-            }
+        payload: dict[str, Any],
+    ) -> ChatbotGraphState:
+        resolution = await self._resolve_entity_request(
+            question=payload["question"],
+            payload=payload["content"],
+        )
+        if resolution is None:
+            raise ValueError(
+                "Não consegui resolver a entidade para continuar a consulta."
+            )
+
+        auto_resolved_choice = resolution.get("resolved_choice")
+        if not auto_resolved_choice:
+            return await self.state_update_chain.ainvoke(
+                {
+                    "state": payload["state"],
+                    "question": payload["question"],
+                    "answer": resolution["message"],
+                    "sql": None,
+                    "pagination": None,
+                    "needs_pagination_confirmation": False,
+                    "pagination_request": None,
+                    "sources": None,
+                    "disambiguation": resolution["disambiguation"],
+                }
+            )
+
+        rerouted_payload = {
+            **payload,
+            "resolved_entities": self._format_resolved_entities(
+                auto_resolved_choice
+            ),
+            "resolution_mode": (
+                "As entidades desta pergunta já foram resolvidas. "
+                "Use os campos `resolved_id` e `resolved_name` "
+                "fornecidos e não retorne [ENTITY_RESOLUTION] "
+                "novamente."
+            ),
+        }
+        rerouted_payload = await self.route_decision_chain.ainvoke(
+            rerouted_payload
+        )
+        if rerouted_payload["response_type"] != "SQL":
+            raise ValueError(
+                "Não consegui gerar a consulta após resolver a entidade."
+            )
+
+        rerouted_payload["sql"] = validate_safe_sql(
+            str(rerouted_payload["content"])
         )
         logger.info(
-            "[chatbot] llm raw response | question=%s | response=%s",
-            question,
-            truncate_text(raw_response, max_chars=600),
+            "[chatbot] generated sql after entity resolution | question=%s | sql=%s",
+            rerouted_payload["question"],
+            rerouted_payload["sql"],
         )
-        return parse_router_response(raw_response)
+        return await self.sql_answer_chain.ainvoke(rerouted_payload)
+
+    async def _pagination_chain_step(
+        self,
+        payload: dict[str, Any],
+    ) -> ChatbotGraphState:
+        return await self._handle_pagination_confirmation(
+            state=payload["state"],
+            page=payload["page"],
+            page_size=payload["page_size"],
+            pagination_request=payload["pagination_request"],
+        )
+
+    async def _sql_answer_chain_step(
+        self,
+        payload: dict[str, Any],
+    ) -> ChatbotGraphState:
+        return await self._answer_from_sql(
+            state=payload["state"],
+            question=payload["question"],
+            sql=payload["sql"],
+            page=payload["page"],
+            page_size=payload["page_size"],
+        )
+
+    def _state_update_chain_step(
+        self,
+        payload: dict[str, Any],
+    ) -> ChatbotGraphState:
+        return self._build_state_update(
+            state=payload["state"],
+            question=payload["question"],
+            answer=payload["answer"],
+            sql=payload["sql"],
+            pagination=payload["pagination"],
+            needs_pagination_confirmation=payload[
+                "needs_pagination_confirmation"
+            ],
+            pagination_request=payload["pagination_request"],
+            sources=payload["sources"],
+            disambiguation=payload.get("disambiguation"),
+        )
 
     def _format_resolved_entities(
         self,
@@ -483,7 +602,7 @@ class ClimateFinanceChatbotAgent:
         state: ChatbotGraphState,
         page: int,
         page_size: int,
-        pagination_request: dict[str, Any],
+        pagination_request: dict[str, Any], # {"question": ...,"sql": ...,"total_rows": ...,"page_size": ...}
     ) -> ChatbotGraphState:
         effective_page_size = int(
             pagination_request.get("page_size") or page_size
@@ -590,8 +709,9 @@ class ClimateFinanceChatbotAgent:
         try:
             total_rows = await self._count_rows(sql)
             sources = self._infer_sources(sql)
+            has_limit = has_explicit_limit(sql)
 
-            if total_rows > page_size and not has_explicit_limit(sql):
+            if total_rows > page_size and not has_limit:
                 answer = (
                     "Encontrei muitos resultados para essa consulta. "
                     f"Deseja que eu mostre os dados paginados em blocos de {page_size} linhas?"
@@ -616,7 +736,7 @@ class ClimateFinanceChatbotAgent:
                 sql,
                 limit=page_size,
                 offset=max(page - 1, 0) * page_size,
-                paginate=not has_explicit_limit(sql),
+                paginate=not has_limit,
             )
             answer = await self._build_final_answer(
                 question=question,
@@ -624,21 +744,12 @@ class ClimateFinanceChatbotAgent:
                 rows=rows,
             )
 
-            pagination = None
-            if not has_explicit_limit(sql) and total_rows > page_size:
-                pagination = self._build_pagination_payload(
-                    page=page,
-                    page_size=page_size,
-                    total_rows=total_rows,
-                    rows=rows,
-                )
-
             return self._build_state_update(
                 state=state,
                 question=question,
                 answer=sanitize_user_facing_answer(answer),
                 sql=sql,
-                pagination=pagination,
+                pagination=None,
                 needs_pagination_confirmation=False,
                 pagination_request=None,
                 sources=sources,
@@ -935,7 +1046,6 @@ ORDER BY cfrd.source_name
         if ranked_matches:
             return ranked_matches[:10]
         return fallback_matches[:5]
-
 
     def _infer_sources(self, sql: str) -> list[dict[str, str]] | None:
         lowered = sql.lower()
