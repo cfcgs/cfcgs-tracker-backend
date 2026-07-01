@@ -232,52 +232,51 @@ class ClimateFinanceChatbotAgent:
         self.settings = Settings()
         self.llm = ChatGoogleGenerativeAI(
             model="gemini-2.5-flash",
-            temperature=0,
+            temperature=0.8,
             google_api_key=self.settings.GEMINI_API_KEY,
         )
         self.router_chain = (
             build_router_prompt() | self.llm | StrOutputParser()
-        )
+        ).with_config({"run_name": "router_chain"})
         self.final_chain = (
             ChatPromptTemplate.from_template(FINAL_ANSWER_PROMPT_TEMPLATE)
             | self.llm
             | StrOutputParser()
-        )
-        self.context_chain = RunnableLambda(
+        ).with_config({"run_name": "final_chain"})
+        self.context_chain = (
+            RunnableLambda(
             self._extract_turn_context
-        ) | RunnableLambda(self._enrich_turn_context)
+        )
+            | RunnableLambda(self._enrich_turn_context)
+        ).with_config({"run_name": "context_chain"})
         self.route_decision_chain = (
             RunnablePassthrough.assign(
-                raw_router_response=(
-                    RunnableLambda(self._build_router_prompt_payload)
-                    | self.router_chain
-                )
+            raw_router_response=(
+                RunnableLambda(self._build_router_prompt_payload)
+                | self.router_chain
             )
+        )
             | RunnableLambda(self._attach_router_decision)
-        )
+        ).with_config({"run_name": "route_decision_chain"})
         self.pagination_chain = RunnableLambda(
-            lambda payload: payload,
-            afunc=self._pagination_chain_step
-        )
+            lambda payload: payload, afunc=self._pagination_chain_step
+        ).with_config({"run_name": "pagination_chain"})
         self.entity_resolution_chain = RunnableLambda(
-            lambda payload: payload,
-            afunc=self._entity_resolution_chain_step
-        )
+            lambda payload: payload, afunc=self._entity_resolution_chain_step
+        ).with_config({"run_name": "entity_resolution_chain"})
         self.selected_entity_chain = RunnableLambda(
-            lambda payload: payload,
-            afunc=self._selected_entity_chain_step
-        )
+            lambda payload: payload, afunc=self._selected_entity_chain_step
+        ).with_config({"run_name": "selected_entity_chain"})
         self.sql_answer_chain = RunnableLambda(
-            lambda payload: payload,
-            afunc=self._sql_answer_chain_step
-        )
+            lambda payload: payload, afunc=self._sql_answer_chain_step
+        ).with_config({"run_name": "sql_answer_chain"})
         self.state_update_chain = RunnableLambda(
             self._state_update_chain_step
-        )
+        ).with_config({"run_name": "state_update_chain"})
         self.dispatch_chain = RunnableLambda(
             lambda payload: payload,
             afunc=self._dispatch_chain_step,
-        )
+        ).with_config({"run_name": "dispatch_chain"})
         self.graph = self._build_graph()
 
     async def ask(
@@ -533,9 +532,7 @@ class ClimateFinanceChatbotAgent:
             raise ValueError(
                 "Não consegui aplicar a entidade selecionada pelo usuário."
             )
-        rerouted_payload["selected_entity_name"] = selected_entity.get(
-            "name"
-        )
+        rerouted_payload["selected_entity_name"] = selected_entity.get("name")
         return await self.dispatch_chain.ainvoke(rerouted_payload)
 
     async def _pagination_chain_step(
@@ -651,7 +648,9 @@ class ClimateFinanceChatbotAgent:
         state: ChatbotGraphState,
         page: int,
         page_size: int,
-        pagination_request: dict[str, Any], # {"question": ...,"sql": ...,"total_rows": ...,"page_size": ...}
+        pagination_request: dict[
+            str, Any
+        ],  # {"question": ...,"sql": ...,"total_rows": ...,"page_size": ...}
     ) -> ChatbotGraphState:
         effective_page_size = int(
             pagination_request.get("page_size") or page_size

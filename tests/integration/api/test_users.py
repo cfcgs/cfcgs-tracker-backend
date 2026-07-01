@@ -159,19 +159,6 @@ def test_read_user_not_found_for_admin(client, admin_token):
     assert response.status_code == HTTPStatus.NOT_FOUND
     assert response.json().get("detail") == "User not found."
 
-
-def test_read_current_user(client, admin_user, admin_token):
-    response = client.get(
-        "/auth/me",
-        headers={"Authorization": f"Bearer {admin_token}"},
-    )
-
-    assert response.status_code == HTTPStatus.OK
-    assert response.json() == UserPublic.model_validate(admin_user).model_dump(
-        mode="json"
-    )
-
-
 def test_update_user_as_importer_on_self(client, user, token):
     response = client.put(
         f"/users/{user.id}",

@@ -1,6 +1,7 @@
 from http import HTTPStatus
 
 from freezegun import freeze_time
+from src.cfcgs_tracker.entrypoints.api.schemas.users import UserPublic
 
 
 def test_get_token(client, user):
@@ -82,6 +83,18 @@ def test_refresh_token(client, user):
     assert "refresh_token" in data
     assert "token_type" in data
     assert data["token_type"] == "Bearer"
+
+
+def test_read_current_user(client, admin_user, admin_token):
+    response = client.get(
+        "/auth/me",
+        headers={"Authorization": f"Bearer {admin_token}"},
+    )
+
+    assert response.status_code == HTTPStatus.OK
+    assert response.json() == UserPublic.model_validate(admin_user).model_dump(
+        mode="json"
+    )
 
 
 def test_token_expired_dont_refresh(client, user):
